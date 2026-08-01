@@ -1,0 +1,31 @@
+{
+	"name": "reviewteam",
+	"version": "2.0.0",
+	"description": "ReviewTeam: two-phase code review pipeline with configurable model critics and a verifying judge",
+	"type": "module",
+	"scripts": {
+		"review": "node council-review-gate.mjs",
+		"calibrate": "node council-calibrate.mjs",
+		"setup": "node setup.mjs",
+		"test": "vitest run",
+		"typecheck": "tsc --noEmit",
+		"lint": "biome lint ."
+	},
+	"keywords": [
+		"code-review",
+		"multi-model",
+		"ai-council",
+		"llm",
+		"static-analysis"
+	],
+	"license": "MIT",
+	"engines": {
+		"node": ">=18.0.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.2.0",
+		"@types/node": "^24.0.0",
+		"typescript": "^5.9.2",
+		"vitest": "^3.2.4"
+	}
+}

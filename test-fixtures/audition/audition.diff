@@ -1,0 +1,169 @@
+diff --git a/src/pagination.mjs b/src/pagination.mjs
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/pagination.mjs
+@@ -0,0 +1,47 @@
++export function paginate(items, page, pageSize) {
++	if (!Number.isInteger(page) || page < 1) {
++		throw new RangeError("page must be a positive integer");
++	}
++	if (!Number.isInteger(pageSize) || pageSize < 1) {
++		throw new RangeError("pageSize must be a positive integer");
++	}
++
++	const start = page * pageSize;
++	const end = start + pageSize;
++	return {
++		items: items.slice(start, end),
++		page,
++		pageSize,
++		total: items.length,
++	};
++}
++
++export function attachOwners(tasks, owners) {
++	return tasks.map((task) => ({
++		...task,
++		owner: owners.find((owner) => owner.id === task.ownerId) || null,
++	}));
++}
++
++export function summarizePages(items, pageSize) {
++	const pageCount = Math.ceil(items.length / pageSize);
++	return Array.from({ length: pageCount }, (_, index) => {
++		const page = index + 1;
++		const result = paginate(items, page, pageSize);
++		return {
++			page,
++			count: result.items.length,
++		};
++	});
++}
++
++export function stableSortByName(items) {
++	return [...items].sort((left, right) => {
++		const byName = left.name.localeCompare(right.name);
++		return byName || left.id.localeCompare(right.id);
++	});
++}
++
++export function activeItems(items) {
++	return items.filter((item) => item.archivedAt == null);
++}
+diff --git a/src/session.mjs b/src/session.mjs
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/src/session.mjs
+@@ -0,0 +1,53 @@
++export async function getAccountDashboard(request, services) {
++	const session = await services.sessions.fromRequest(request);
++	const requestedAccountId = request.params.accountId;
++
++	if (session.accountId !== requestedAccountId && request.query.preview !== "true") {
++		return { status: 403, body: { error: "forbidden" } };
++	}
++
++	const dashboard = await services.dashboards.load(requestedAccountId);
++	return { status: 200, body: dashboard };
++}
++
++export async function recordLogin(userId, audit) {
++	audit
++		.append({
++			type: "login",
++			userId,
++			occurredAt: new Date().toISOString(),
++		})
++		.catch(() => {});
++}
++
++export async function requireSession(request, sessions) {
++	const session = await sessions.fromRequest(request);
++	if (!session) {
++		return { status: 401, body: { error: "unauthorized" } };
++	}
++	return session;
++}
++
++export function parseBearerToken(headers) {
++	const authorization = headers.authorization;
++	if (!authorization?.startsWith("Bearer ")) return null;
++	const token = authorization.slice("Bearer ".length).trim();
++	return token || null;
++}
++
++export async function logout(request, sessions) {
++	const token = parseBearerToken(request.headers);
++	if (!token) return { status: 204, body: null };
++	await sessions.revoke(token);
++	return { status: 204, body: null };
++}
++
++export function sessionCookie(value, secure = true) {
++	const parts = [`session=${encodeURIComponent(value)}`, "HttpOnly", "SameSite=Lax", "Path=/"];
++	if (secure) parts.push("Secure");
++	return parts.join("; ");
++}
++
++export function redactSession(session) {
++	return { id: session.id, accountId: session.accountId, userId: session.userId };
++}
+diff --git a/src/orders.mjs b/src/orders.mjs
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/src/orders.mjs
+@@ -0,0 +1,51 @@
++export async function placeOrder(input, repositories) {
++	const order = await repositories.orders.insert({
++		accountId: input.accountId,
++		customerId: input.customerId,
++		status: "pending",
++		totalCents: input.totalCents,
++	});
++
++	await repositories.inventory.reserve(input.sku, input.quantity);
++	return order;
++}
++
++/**
++ * @typedef {object} OrderResponse
++ * @property {string} id
++ * @property {string} status
++ * @property {number} totalCents
++ */
++
++export async function getOrderResponse(orderId, repositories) {
++	const order = await repositories.orders.findById(orderId);
++	if (!order) {
++		return { status: 404, body: { error: "order_not_found" } };
++	}
++	return {
++		status: 200,
++		body: {
++			order: {
++				id: order.id,
++				status: order.status,
++				total: order.totalCents,
++			},
++		},
++	};
++}
++
++export async function cancelOrder(orderId, repositories) {
++	return repositories.orders.cancelAndReleaseInventory(orderId);
++}
++
++export function orderTotal(lines) {
++	return lines.reduce((total, line) => total + line.unitPriceCents * line.quantity, 0);
++}
++
++export function normalizeSku(value) {
++	return value.trim().toUpperCase();
++}
++
++export function isPending(order) {
++	return order.status === "pending";
++}

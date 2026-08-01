@@ -1,0 +1,9 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.5.6/schema.json",
+	"files": {
+		"includes": ["**/*.mjs", "**/*.json", "**/*.md", "!node_modules"]
+	},
+	"linter": {
+		"enabled": true
+	}
+}

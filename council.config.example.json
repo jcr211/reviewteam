@@ -1,0 +1,58 @@
+{
+	"projectName": "ParcelHub",
+	"description": "A multi-account parcel tracking service built with TypeScript and PostgreSQL.",
+	"reviewConcerns": [
+		"Every account-scoped read and write enforces account isolation.",
+		"Webhook requests are authenticated before their payloads are parsed.",
+		"Retryable jobs are idempotent and never duplicate notifications."
+	],
+	"architectureRules": [
+		"HTTP handlers call application services instead of database adapters directly.",
+		"Public response types are defined in src/contracts before handler implementation.",
+		"State changes emit an append-only activity event in the same transaction."
+	],
+	"pathTierRules": [
+		{
+			"pattern": "db/migrations/**",
+			"tier": "CRITICAL",
+			"reason": "Database migrations can affect stored data and access controls."
+		},
+		{
+			"pattern": "src/auth/**",
+			"tier": "CRITICAL",
+			"reason": "Authentication code defines a trust boundary."
+		},
+		{
+			"pattern": "src/billing/**",
+			"tier": "CRITICAL",
+			"reason": "Billing changes can create financial side effects."
+		},
+		{
+			"pattern": "docs/**",
+			"tier": "DOCS",
+			"reason": "Documentation-only changes use the reduced review bench."
+		}
+	],
+	"critics": ["codex", "claude", "grok"],
+	"criticSpecialties": {
+		"codex": {
+			"label": "Correctness and data integrity",
+			"prompt": "Focus on transaction boundaries, idempotency, state transitions, and data-loss risks."
+		},
+		"claude": {
+			"label": "Security and API contracts",
+			"prompt": "Focus on authorization, untrusted inputs, secret handling, and public API compatibility."
+		},
+		"grok": {
+			"label": "Generalist and failure modes",
+			"prompt": "Review the whole diff for anything the specialist lenses may miss, with extra attention to error handling, retry and timeout behaviour, partial-failure paths, and what breaks under load or when a dependency is unavailable."
+		}
+	},
+	"criticCommands": {},
+	"judgeModel": "claude-opus-5",
+	"timeoutSeconds": 300,
+	"judgeTimeoutSeconds": 360,
+	"maxDiffBytes": 200000,
+	"logDir": ".reviewteam/review-logs",
+	"memoryDir": ".reviewteam/memory"
+}

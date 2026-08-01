@@ -1,0 +1,8 @@
+node_modules/
+review-logs/
+.council-memory/
+.reviewteam/
+council.config.json
+
+# Stray output file created by some Windows CLI wrappers.
+-

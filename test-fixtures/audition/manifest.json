@@ -1,0 +1,41 @@
+{
+	"fixture": "audition.diff",
+	"plants": [
+		{
+			"class": "correctness",
+			"file": "src/pagination.mjs",
+			"lineStart": 8,
+			"lineEnd": 10
+		},
+		{
+			"class": "performance",
+			"file": "src/pagination.mjs",
+			"lineStart": 19,
+			"lineEnd": 23
+		},
+		{
+			"class": "security",
+			"file": "src/session.mjs",
+			"lineStart": 5,
+			"lineEnd": 7
+		},
+		{
+			"class": "error-handling",
+			"file": "src/session.mjs",
+			"lineStart": 13,
+			"lineEnd": 20
+		},
+		{
+			"class": "data-integrity",
+			"file": "src/orders.mjs",
+			"lineStart": 1,
+			"lineEnd": 10
+		},
+		{
+			"class": "api-contract",
+			"file": "src/orders.mjs",
+			"lineStart": 19,
+			"lineEnd": 33
+		}
+	]
+}
