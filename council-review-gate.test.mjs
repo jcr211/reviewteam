@@ -175,7 +175,7 @@ describe("buildConsultCriticPrompt", () => {
 		expect(prompt).not.toContain("Start your output with ALLOW or BLOCK");
 		expect(prompt).not.toContain("Severity-tag each finding");
 		// The no-tools line must survive into consult mode.
-		expect(prompt).toContain("You have NO tools");
+		expect(prompt).toContain("You have NO shell and NO git");
 		expect(prompt).toContain("Do NOT produce an approval verdict");
 	});
 
@@ -190,19 +190,19 @@ describe("buildConsultCriticPrompt", () => {
 describe("getSpecializationBlock", () => {
 	it("keeps review-only verdict directives in review mode (default)", () => {
 		const block = getSpecializationBlock("grok");
-		expect(block).toContain("You have NO tools");
+		expect(block).toContain("You have NO shell and NO git");
 		expect(block).toContain("Start your output with ALLOW or BLOCK");
 	});
 
 	it("strips review-only directives in consult mode, keeps emphasis", () => {
 		const block = getSpecializationBlock("grok", "consult");
-		expect(block).toContain("You have NO tools");
+		expect(block).toContain("You have NO shell and NO git");
 		expect(block).not.toContain("Start your output with ALLOW or BLOCK");
 	});
 
 	it("resolves grok aliases to the grok persona (no-tools line) in both modes", () => {
 		for (const mode of ["review", "consult"]) {
-			expect(getSpecializationBlock("grok-cli", mode)).toContain("You have NO tools");
+			expect(getSpecializationBlock("grok-cli", mode)).toContain("You have NO shell and NO git");
 		}
 	});
 

@@ -591,7 +591,7 @@ const SPECIALIZATIONS = {
 		emphasis: [
 			"YOUR ROLE: the council's GENERALIST. The other critics each own a NARROW lane (correctness/atomicity, security/database, error-handling/architecture, security-surface) and deliberately deprioritize everything else. You are NOT lane-constrained — do the holistic whole-diff read a senior engineer does last: surface the most important issues, ESPECIALLY anything that falls between the specialists' lanes or that a narrow lens would miss.",
 			"Range freely: subtle logic bugs, cross-cutting design/architecture problems, money-safety / fail-closed gaps, missing edge cases, maintainability and readability traps, incorrect assumptions, test gaps, or risks that don't fit a single category.",
-			"You have NO tools: do not attempt to read files, run commands, fetch the branch, or inspect the working tree. The diff in this prompt IS the complete review input; if it looks partial or truncated, that is intentional — review exactly what is shown and say so. Any attempt to gather more context ends your review with no verdict.",
+			"You have NO shell and NO git: never run commands, fetch the branch, or inspect the working tree. This prompt file IS the complete review input. If your client shows you only an excerpt of it, re-read this same prompt file with read_file and review that; never look for the diff anywhere else. Any attempt to run commands ends your review with no verdict.",
 			"Prioritize real, high-signal findings over nitpicks. Lead with the single most important issue. If nothing is wrong, say so plainly.",
 		],
 		reviewOnly: ["Severity-tag each finding P0/P1/P2/P3. Start your output with ALLOW or BLOCK."],
@@ -707,7 +707,13 @@ function detectBaseBranch() {
 
 function getFullDiff(base) {
 	const mergeBase = gitSafe("merge-base", base, "HEAD") || base;
-	const diff = git("diff", mergeBase, "HEAD");
+	// Deleted files contribute nothing reviewable but can dwarf the real change (e.g. untracking logs):
+	// exclude their bodies and list them by name instead.
+	const deleted = gitSafe("diff", "--name-only", "--diff-filter=D", mergeBase, "HEAD");
+	const body = git("diff", "--diff-filter=d", mergeBase, "HEAD");
+	const diff = deleted?.trim()
+		? `[DELETED FILES (bodies omitted)]\n${deleted.trim()}\n\n${body}`
+		: body;
 
 	if (diff.length > MAX_DIFF_BYTES) {
 		const statSummary = git("diff", "--stat", mergeBase, "HEAD");
@@ -1000,12 +1006,12 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 				"--output-format",
 				"plain",
 				"--disable-web-search",
-				// The prompt says "you have NO tools", but on large prompt files the grok CLI notes the prompt
-				// was "offloaded" and the model detours into read_file/grep/subagents, then exits with only
-				// narration (critic_no_output). Disallow those tools and subagents so it answers from context.
+				// On large prompt files the grok CLI shows the model a truncated excerpt and expects it to re-read
+				// the file. Reads are fine (plan mode is read-only); what must never happen is the model running
+				// git/shell or spawning subagents to "find the real diff" — that path ends with narration only.
 				"--no-subagents",
 				"--disallowed-tools",
-				"run_terminal_command,read_file,list_dir,grep,search_replace,spawn_subagent,use_tool,workflow,search_tool",
+				"run_terminal_command,search_replace,spawn_subagent,use_tool,workflow,search_tool",
 				// NO --effort: grok-4.5 accepts reasoningEffort; we still omit it for safety — revisit
 				// before re-adding because the old grok-composer path 400ed and caused empty verdicts.
 				"--max-turns",
@@ -3673,6 +3679,11 @@ function writeLog(logData) {
 			for (const c of logData.criticFullOutputs) {
 				const content = c.output || `(no output — ${c.error || "unknown error"})`;
 				writeFileSync(path.join(runDir, `${c.provider}.md`), content, "utf8");
+				// Always keep the untouched CLI output beside the verdict so a critic_no_output can be diagnosed
+				// from the run directory without re-spending provider quota.
+				const raw = c.rawOutput ?? "";
+				const err = c.stderr ?? "";
+				if (raw || err) writeFileSync(path.join(runDir, `${c.provider}.raw.txt`), `${raw}${err ? `\n\n--- stderr ---\n${err}` : ""}`, "utf8");
 			}
 		}
 		if (logData.judgeFullOutput) {
