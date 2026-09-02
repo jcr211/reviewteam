@@ -1061,7 +1061,7 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 				buildOpenCodeArgs(
 					isConsult
 						? "Read the advisory task in the attached file and follow its instructions exactly. Output only your advisory response."
-						: "Analyze the code review task in the attached file. List every bug, security issue, and code quality problem you find. Include file paths and line numbers for each issue.",
+						: "The attached file is the complete review task and diff; do not explore the repository, read other files, or run commands. Analyze the code review task in the attached file. List every bug, security issue, and code quality problem you find. Include file paths and line numbers for each issue.",
 					tempFilePath,
 					options.modelOverride || OPENCODE_COUNCIL_MODEL,
 				),
