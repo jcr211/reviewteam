@@ -1000,6 +1000,12 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 				"--output-format",
 				"plain",
 				"--disable-web-search",
+				// The prompt says "you have NO tools", but on large prompt files the grok CLI notes the prompt
+				// was "offloaded" and the model detours into read_file/grep/subagents, then exits with only
+				// narration (critic_no_output). Disallow those tools and subagents so it answers from context.
+				"--no-subagents",
+				"--disallowed-tools",
+				"run_terminal_command,read_file,list_dir,grep,search_replace,spawn_subagent,use_tool,workflow,search_tool",
 				// NO --effort: grok-4.5 accepts reasoningEffort; we still omit it for safety — revisit
 				// before re-adding because the old grok-composer path 400ed and caused empty verdicts.
 				"--max-turns",

@@ -873,7 +873,9 @@ describe("getProviderConfig consult mode — no code-review framing in wrapper t
 				const args = config.buildArgs("/tmp/test-plan.md");
 				const argsText = args.join(" ");
 				for (const term of REVIEW_TERMS) {
-					expect(argsText.toLowerCase()).not.toContain(term.toLowerCase());
+					// Whole-word match so CLI flags such as `--disallowed-tools` do not trip "ALLOW".
+					const re = new RegExp(`(^|[^a-z])${term.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-z]|$)`, "i");
+					expect(re.test(argsText.toLowerCase())).toBe(false);
 				}
 			}
 		});
