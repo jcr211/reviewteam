@@ -14,6 +14,18 @@ import path from "node:path";
 // pre-security-seat history (measured max 16.0 min over 818 runs) and was observed too tight
 // live on 2026-07-27 — a healthy security-bearing run crossed 30 min while still working.
 const STALE_THRESHOLD_MS = 45 * 60 * 1_000; // 45 minutes
+
+// A lock whose holder process no longer exists is stale regardless of age (a killed run must not block
+// the next one for 45 minutes). kill(pid, 0) probes existence; EPERM means alive-but-not-ours.
+function _pidAlive(pid) {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return err?.code === "EPERM";
+	}
+}
 const ownedRunLockTokens = new Map();
 
 /**
@@ -37,7 +49,7 @@ export function acquireRunLock(lockPath) {
 	const existing = _readLockSnapshot(lockPath);
 	if (existing?.record) {
 		const ageMs = Date.now() - Date.parse(existing.record.startedAt);
-		if (ageMs < STALE_THRESHOLD_MS) {
+		if (ageMs < STALE_THRESHOLD_MS && _pidAlive(existing.record.pid)) {
 			return {
 				ok: false,
 				holderPid: existing.record.pid,

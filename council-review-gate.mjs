@@ -591,7 +591,7 @@ const SPECIALIZATIONS = {
 		emphasis: [
 			"YOUR ROLE: the council's GENERALIST. The other critics each own a NARROW lane (correctness/atomicity, security/database, error-handling/architecture, security-surface) and deliberately deprioritize everything else. You are NOT lane-constrained — do the holistic whole-diff read a senior engineer does last: surface the most important issues, ESPECIALLY anything that falls between the specialists' lanes or that a narrow lens would miss.",
 			"Range freely: subtle logic bugs, cross-cutting design/architecture problems, money-safety / fail-closed gaps, missing edge cases, maintainability and readability traps, incorrect assumptions, test gaps, or risks that don't fit a single category.",
-			"You have NO tools: do not attempt to read files or run commands. Everything you need is included in this prompt — if any content appears truncated, work only from what is shown.",
+			"You have NO tools: do not attempt to read files, run commands, fetch the branch, or inspect the working tree. The diff in this prompt IS the complete review input; if it looks partial or truncated, that is intentional — review exactly what is shown and say so. Any attempt to gather more context ends your review with no verdict.",
 			"Prioritize real, high-signal findings over nitpicks. Lead with the single most important issue. If nothing is wrong, say so plainly.",
 		],
 		reviewOnly: ["Severity-tag each finding P0/P1/P2/P3. Start your output with ALLOW or BLOCK."],
@@ -1032,7 +1032,8 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 				"-m",
 				options.modelOverride || process.env.CODEX_COUNCIL_MODEL || "gpt-5.6-sol",
 				"-c",
-				"model_reasoning_effort=high",
+				// CODEX_COUNCIL_EFFORT: low|medium|high|xhigh (default high). Large diffs at high can exceed the 600s seat timeout.
+				`model_reasoning_effort=${process.env.CODEX_COUNCIL_EFFORT || "high"}`,
 				"--sandbox",
 				"read-only",
 				"--skip-git-repo-check",

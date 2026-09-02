@@ -30,9 +30,20 @@ describe("acquireRunLock", () => {
 		expect(typeof parsed.token).toBe("string");
 	});
 
+	test("a lock held by a dead process is stale regardless of age", () => {
+		// PID 4_000_000 is above the Windows/Linux pid range, so it never refers to a live process.
+		const existing = JSON.stringify({
+			pid: 4_000_000,
+			startedAt: new Date().toISOString(),
+			token: "foreign",
+		});
+		fs.writeFileSync(lockPath, existing, { encoding: "utf8", flag: "wx" });
+		expect(acquireRunLock(lockPath)).toEqual({ ok: true });
+	});
+
 	test("exclusive create makes a pre-created race winner contended", () => {
 		const existing = JSON.stringify({
-			pid: 12345,
+			pid: process.pid, // a live holder
 			startedAt: new Date().toISOString(),
 			token: "foreign",
 		});
@@ -43,7 +54,7 @@ describe("acquireRunLock", () => {
 
 		expect(acquireRunLock(lockPath)).toEqual({
 			ok: false,
-			holderPid: 12345,
+			holderPid: process.pid,
 			ageMinutes: 0,
 		});
 		expect(fs.readFileSync(lockPath, "utf8")).toBe(existing);
