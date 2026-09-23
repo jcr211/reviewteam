@@ -49,7 +49,7 @@
 		}
 	},
 	"criticCommands": {},
-	"judgeModel": "claude-opus-5",
+	"judgeModel": "claude-opus-5-5",
 	"timeoutSeconds": 300,
 	"judgeTimeoutSeconds": 360,
 	"maxDiffBytes": 200000,

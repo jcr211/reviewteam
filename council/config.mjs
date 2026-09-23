@@ -37,7 +37,7 @@ export const DEFAULT_CONFIG = {
 	critics: ["codex", "claude"],
 	criticSpecialties: {},
 	criticCommands: {},
-	judgeModel: "claude-opus-5",
+	judgeModel: "claude-opus-5-5",
 	judgeCanExecute: true,
 	timeoutSeconds: 300,
 	judgeTimeoutSeconds: 360,

@@ -65,11 +65,15 @@ Five adapters ship built in. Each shells out to a CLI you install and authentica
 
 | ID | CLI | Default model | Overrides |
 |---|---|---|---|
-| `codex` | `codex` | `gpt-5.6-sol` | `CODEX_BIN`, `CODEX_COUNCIL_MODEL` |
+| `codex` | `codex` | `gpt-6-sol` | `CODEX_BIN`, `CODEX_COUNCIL_MODEL` |
 | `claude` | `claude` | falls back to `judgeModel` | `CLAUDE_BIN`, `CLAUDE_CRITIC_MODEL` |
-| `grok` | `grok` | `grok-4.5` | `GROK_BIN`, `GROK_COUNCIL_MODEL` |
-| `opencode` | `opencode` | `opencode-go/deepseek-v4-pro` | `OPENCODE_COUNCIL_MODEL` |
+| `grok` | `grok` | `grok-4.7` | `GROK_BIN`, `GROK_COUNCIL_MODEL` |
+| `opencode` | `opencode` | `opencode-go/deepseek-v4.1-flash` | `OPENCODE_COUNCIL_MODEL` |
 | `omp` | `omp` | omp's configured model | `OMP_BIN`, `OMP_COUNCIL_MODEL` |
+
+CLI version floors for these defaults: `gpt-6-sol` needs a Codex CLI newer than 0.144 (older builds answer
+`400 … model is not supported when using Codex with a ChatGPT account`), and the `claude-opus-5-5` judge needs Claude
+Code 2.1.280 or newer. If your PATH copy is older, point `CODEX_BIN` / `CLAUDE_BIN` at a newer binary.
 
 The `opencode` default is deliberately not an OpenAI model — the `codex` adapter already covers that family, so pairing them gives you two vendors rather than two views of the same one.
 
@@ -178,7 +182,7 @@ Exit codes are `0` for `ALLOW`, `1` for `BLOCK`, `2` for a harness error, and `3
 | `critics` | string[] | `["codex", "claude"]` | Phase 1 critic IDs. IDs may select built-in adapters or entries in `criticCommands`. |
 | `criticSpecialties` | object | `{}` | Per-critic label and prompt override. |
 | `criticCommands` | object | `{}` | Definitions for arbitrary CLI-driven critics. |
-| `judgeModel` | string | `"claude-opus-5"` | Model argument passed to the Claude CLI for Phase 2. |
+| `judgeModel` | string | `"claude-opus-5-5"` | Model argument passed to the Claude CLI for Phase 2. |
 | `judgeCanExecute` | boolean | `true` | When `true`, CRITICAL-tier review grants the judge Bash access in a disposable worktree (see below). When `false`, CRITICAL uses the STANDARD tool set. Teams that don't want a model executing anything can turn this off and keep search-only verification. |
 | `timeoutSeconds` | integer | `300` | Base critic wall-clock timeout. Built-in adapters may enforce a larger minimum. |
 | `judgeTimeoutSeconds` | integer | `360` | Judge wall-clock timeout. Doubled to 2× when the judge runs at the Bash tier (CRITICAL + `judgeCanExecute: true`), because verification takes longer than reading. |

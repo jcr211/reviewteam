@@ -50,7 +50,7 @@ const PHASE1_CRITICS = process.env.COUNCIL_CRITICS
 			.filter(Boolean)
 	: FULL_COUNCIL_CRITICS;
 const JUDGE_MODEL = COUNCIL_CONFIG.judgeModel;
-const GROK_COUNCIL_MODEL = process.env.GROK_COUNCIL_MODEL || "grok-4.5";
+const GROK_COUNCIL_MODEL = process.env.GROK_COUNCIL_MODEL || "grok-4.7";
 
 function stripTrailingV1(url) {
 	return url
@@ -188,7 +188,7 @@ const OPENCODE_PS1 =
 // Defaults to a non-OpenAI model on purpose: the codex adapter already covers that
 // family, and critics from different families miss different defects.
 const OPENCODE_COUNCIL_MODEL =
-	process.env.OPENCODE_COUNCIL_MODEL || "opencode-go/deepseek-v4-pro";
+	process.env.OPENCODE_COUNCIL_MODEL || "opencode-go/deepseek-v4.1-flash";
 const STD_GROK_BIN = path.join(
 	homedir(),
 	".grok",
@@ -1012,7 +1012,7 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 				"--no-subagents",
 				"--disallowed-tools",
 				"run_terminal_command,search_replace,spawn_subagent,use_tool,workflow,search_tool",
-				// NO --effort: grok-4.5 accepts reasoningEffort; we still omit it for safety — revisit
+				// NO --effort: grok-4.7 accepts reasoningEffort; we still omit it for safety — revisit
 				// before re-adding because the old grok-composer path 400ed and caused empty verdicts.
 				"--max-turns",
 				"15",
@@ -1036,7 +1036,7 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 			args: [
 				"exec",
 				"-m",
-				options.modelOverride || process.env.CODEX_COUNCIL_MODEL || "gpt-5.6-sol",
+				options.modelOverride || process.env.CODEX_COUNCIL_MODEL || "gpt-6-sol",
 				"-c",
 				// CODEX_COUNCIL_EFFORT: low|medium|high|xhigh (default high). Large diffs at high can exceed the 600s seat timeout.
 				`model_reasoning_effort=${process.env.CODEX_COUNCIL_EFFORT || "high"}`,
@@ -1569,7 +1569,7 @@ function hasCriticFindingsJsonBlock(output) {
 }
 
 /**
- * Agentic critic CLIs (grok-4.5, omp) can prepend a narration preamble
+ * Agentic critic CLIs (grok-4.7, omp) can prepend a narration preamble
  * ("I'll review the full branch diff…") and glue the ALLOW:/BLOCK: verdict onto the same line,
  * defeating the line-anchored verdict detector and first-content-line parser, causing a false
  * critic_no_output when short, mis-tallied BLOCK when long. Re-anchor the LAST explicit verdict

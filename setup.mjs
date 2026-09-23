@@ -24,10 +24,10 @@ const AUDITION_CLASSES = [
 ];
 
 const DEFAULT_MODELS = {
-	codex: process.env.CODEX_COUNCIL_MODEL || "gpt-5.6-sol",
+	codex: process.env.CODEX_COUNCIL_MODEL || "gpt-6-sol",
 	claude: process.env.CLAUDE_CRITIC_MODEL || DEFAULT_CONFIG.judgeModel,
-	grok: process.env.GROK_COUNCIL_MODEL || "grok-4.5",
-	opencode: process.env.OPENCODE_COUNCIL_MODEL || "opencode-go/deepseek-v4-pro",
+	grok: process.env.GROK_COUNCIL_MODEL || "grok-4.7",
+	opencode: process.env.OPENCODE_COUNCIL_MODEL || "opencode-go/deepseek-v4.1-flash",
 	omp: process.env.OMP_COUNCIL_MODEL || "CLI configured default",
 };
 
