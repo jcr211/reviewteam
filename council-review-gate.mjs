@@ -869,9 +869,27 @@ function buildTaskPrompt(branchInfo, provider = null) {
 	return `${basePrompt}${getSpecializationBlock(provider)}\n${jsonBlock}`;
 }
 
+/**
+ * Critic prompt files live INSIDE the reviewed repository (`<logDir's parent>/tmp/`, which the log
+ * directory convention already keeps out of version control), not in the OS temp dir. A critic CLI
+ * that runs non-interactively (opencode's read-only plan agent) shows the model a truncated excerpt
+ * of an attached file and lets it re-read the file only inside the project; from the OS temp dir
+ * that read is refused, the critic answers with a one-line plan, and the harness drops the seat as
+ * `critic_no_output`. Falls back to the OS temp dir when the project directory is not writable.
+ */
+function critTempDir() {
+	const local = path.join(process.cwd(), path.dirname(COUNCIL_CONFIG.logDir), "tmp");
+	try {
+		mkdirSync(local, { recursive: true });
+		return local;
+	} catch {
+		return tmpdir();
+	}
+}
+
 function writeTempFile(content, suffix = ".txt") {
 	const tempPath = path.join(
-		tmpdir(),
+		critTempDir(),
 		`council-critic-${Date.now()}-${Math.random().toString(36).slice(2)}${suffix}`,
 	);
 	writeFileSync(tempPath, content, "utf8");
