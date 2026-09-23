@@ -932,7 +932,36 @@ function parseNdjsonOpencode(stdout) {
 	return parts.join("");
 }
 
-function buildOpenCodeArgs(prompt, promptFilePath = null, model = OPENCODE_COUNCIL_MODEL) {
+function inspectOpenCodeEvents(stdout) {
+	let sessionID = null;
+	let lastFinish = null;
+	let finalText = "";
+	for (const line of (stdout || "").split("\n")) {
+		if (!line.trim()) continue;
+		let event;
+		try {
+			event = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (event.sessionID) sessionID = event.sessionID;
+		if (event.type === "step_start") finalText = "";
+		if (event.type === "text") finalText += event.part?.text || "";
+		if (event.type === "step_finish") lastFinish = event;
+	}
+	if (lastFinish?.part?.reason !== "length" || finalText.trim()) return null;
+	return {
+		reason: "reasoning_exhausted",
+		stepFinishReason: "length",
+		tokens: {
+			reasoning: lastFinish.part.tokens?.reasoning ?? null,
+			output: lastFinish.part.tokens?.output ?? null,
+		},
+		sessionID: lastFinish.sessionID || sessionID,
+	};
+}
+
+function buildOpenCodeArgs(prompt, promptFilePath = null, model = OPENCODE_COUNCIL_MODEL, runOptions = []) {
 	// Read-only plan agent avoids TTY-less permission hangs without granting mutating tools.
 	// The preflight uses the same read-only execution path as a real critic run.
 	return [
@@ -945,6 +974,7 @@ function buildOpenCodeArgs(prompt, promptFilePath = null, model = OPENCODE_COUNC
 		"plan",
 		"--model",
 		model,
+		...runOptions,
 		prompt,
 		...(promptFilePath ? ["-f", promptFilePath] : []),
 	];
@@ -1110,6 +1140,7 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 			minTimeout: 300_000,
 			noShell: process.platform === "win32",
 			twoPass: !isConsult,
+			model: options.modelOverride || OPENCODE_COUNCIL_MODEL,
 		};
 	}
 
@@ -1756,14 +1787,99 @@ function normalizeOpenCodeRetryFailure(result) {
 	return result;
 }
 
-async function retryOpenCodeOnce(provider, config, prompt, timeoutMs, firstResult) {
+async function retryOpenCodeOnce(provider, config, prompt, deadline, firstResult) {
 	const reason = firstResult.ok ? "empty output" : firstResult.error || "failure";
 	console.error(
 		`  [${provider}] ${reason}; retrying once after ${OPENCODE_RETRY_DELAY_MS / 1000}s...`,
 	);
+	if (deadline - Date.now() <= OPENCODE_RETRY_DELAY_MS) return normalizeOpenCodeRetryFailure(firstResult);
 	await delay(OPENCODE_RETRY_DELAY_MS);
-	const retryResult = await spawnCriticOnce(provider, config, prompt, timeoutMs);
-	return normalizeOpenCodeRetryFailure(retryResult);
+	const retryResult = await spawnCriticOnce(provider, { ...config, minTimeout: 0 }, prompt, deadline - Date.now());
+	return {
+		...normalizeOpenCodeRetryFailure(retryResult),
+		openCodeAttempted: true,
+		durationMs: firstResult.durationMs + retryResult.durationMs,
+	};
+}
+
+const OPENCODE_RECOVERY_INSTRUCTION =
+	"Your reasoning budget is exhausted. Write the findings and the verdict now, in the required format, without further analysis.";
+
+function probeOpenCodeRunHelp(config, timeoutMs) {
+	try {
+		return execFileSync(
+			config.cmd,
+			[...(process.platform === "win32" ? ["-NoProfile", "-File", OPENCODE_PS1] : []), "run", "--help"],
+			{ encoding: "utf8", timeout: Math.max(1, Math.min(timeoutMs, 5000)) },
+		);
+	} catch {
+		return "";
+	}
+}
+
+function hasRecoveredCriticVerdict(output) {
+	if (collectCriticVerdictLines(output).length !== 1) return false;
+	if (
+		parseJsonFindings(output) === null &&
+		!/(?:^|\n)\s*(?:[-*]\s+\S|No findings\b|Findings:\s*\S)/im.test(output)
+	) return false;
+	return ["allow", "block"].includes(parseCriticVerdict(output).decision);
+}
+
+async function recoverOpenCodeLength(
+	config,
+	prompt,
+	firstResult,
+	deadline,
+	run = spawnCriticOnce,
+	probe = probeOpenCodeRunHelp,
+) {
+	const diagnosis = inspectOpenCodeEvents(firstResult.rawOutput);
+	if (!diagnosis) return firstResult;
+	const metadata = {
+		reason: diagnosis.reason,
+		stepFinishReason: diagnosis.stepFinishReason,
+		tokens: diagnosis.tokens,
+	};
+	const remaining = deadline - Date.now();
+	if (remaining <= 0) return { ...firstResult, ...metadata, ok: false, error: "OpenCode reasoning exhausted; seat timeout reached" };
+	const help = await probe(config, remaining);
+	const canContinue = Boolean(diagnosis.sessionID && /--session\b/.test(help));
+	const variant = /--variant\b/.test(help) ? ["--variant", "minimal"] : [];
+	const recoveryConfig = canContinue
+		? {
+			...config,
+			args: buildOpenCodeArgs(
+				OPENCODE_RECOVERY_INSTRUCTION, null, config.model, ["--session", diagnosis.sessionID],
+			),
+			promptAsTempFile: false,
+			useTempFile: false,
+			minTimeout: 0,
+		}
+		: {
+			...config,
+			buildArgs: (file) =>
+				buildOpenCodeArgs(
+					`Read the attached review task and diff again. ${OPENCODE_RECOVERY_INSTRUCTION}`,
+					file,
+					config.model,
+					variant,
+				),
+			minTimeout: 0,
+		};
+	const budget = deadline - Date.now();
+	if (budget <= 0) return { ...firstResult, ...metadata, ok: false, error: "OpenCode reasoning exhausted; seat timeout reached" };
+	const recovered = await run("opencode", recoveryConfig, canContinue ? OPENCODE_RECOVERY_INSTRUCTION : prompt, budget);
+	const accepted = recovered.ok && hasRecoveredCriticVerdict(recovered.output || "");
+	return {
+		...recovered,
+		...metadata,
+		ok: accepted,
+		error: accepted ? null : recovered.error || "OpenCode reasoning recovery produced no parseable findings and verdict",
+		recovered: accepted ? "reasoning_exhausted" : undefined,
+		durationMs: firstResult.durationMs + recovered.durationMs,
+		rawOutput: `${firstResult.rawOutput || ""}\n${recovered.rawOutput || ""}`.trim(),
+	};
 }
 
 async function spawnCritic(provider, prompt, timeoutMs, mode = "review", options = {}) {
@@ -1778,14 +1894,22 @@ async function spawnCritic(provider, prompt, timeoutMs, mode = "review", options
 		};
 	}
 
-	let result = normalizeProviderFailure(await spawnCriticOnce(provider, config, prompt, timeoutMs));
+	const openCodeDeadline = isOpenCodeProvider(provider) ? Date.now() + timeoutMs : null;
+	let result = normalizeProviderFailure(await spawnCriticOnce(
+		provider,
+		openCodeDeadline ? { ...config, minTimeout: 0 } : config,
+		prompt,
+		timeoutMs,
+	));
+	if (openCodeDeadline && inspectOpenCodeEvents(result.rawOutput)) {
+		result = await recoverOpenCodeLength(config, prompt, result, openCodeDeadline);
+		if (!result.ok) return result;
+	} else if (isOpenCodeProvider(provider) && shouldRetryOpenCodeResult(result)) {
+		result = await retryOpenCodeOnce(provider, config, prompt, openCodeDeadline, result);
+		if (!result.ok) return result;
+	}
 
-	if (isOpenCodeProvider(provider) && shouldRetryOpenCodeResult(result)) {
-		result = await retryOpenCodeOnce(provider, config, prompt, timeoutMs, result);
-		if (!result.ok) {
-			return result;
-		}
-	} else {
+	if (!isOpenCodeProvider(provider)) {
 		if (
 			!result.ok &&
 			config.fallbackArgs &&
@@ -1814,12 +1938,15 @@ async function spawnCritic(provider, prompt, timeoutMs, mode = "review", options
 		}
 	}
 
-	if (config.twoPass && result.ok && hasCriticOutput(result)) {
+	if (config.twoPass && result.ok && hasCriticOutput(result) && !result.recovered) {
 		console.error(
 			`  [${provider}] Pass 1 complete (${(result.durationMs / 1000).toFixed(1)}s), running grading pass (direct API, thinking OFF)...`,
 		);
 		const pass2Prompt = buildPass2Prompt(result.output);
-		const pass2Result = await callLocalModelDirect(pass2Prompt, { timeout: 60_000 });
+		const pass2Budget = openCodeDeadline ? Math.min(60_000, openCodeDeadline - Date.now()) : 60_000;
+		const pass2Result = pass2Budget > 0
+			? await callLocalModelDirect(pass2Prompt, { timeout: pass2Budget })
+			: { ok: false, error: "seat timeout reached" };
 		if (pass2Result.ok && pass2Result.output?.trim()) {
 			result = {
 				provider,
@@ -1838,11 +1965,20 @@ async function spawnCritic(provider, prompt, timeoutMs, mode = "review", options
 
 	// A critic lacking both verdict heading and findings JSON is retried once, then excluded.
 	if (mode === "review" && result.ok && isCriticNoVerdict(result.output || "")) {
+		if (openCodeDeadline && result.openCodeAttempted) return markCriticNoOutput(result);
+		if (openCodeDeadline && openCodeDeadline - Date.now() <= CRITIC_NO_VERDICT_RETRY_DELAY_MS) {
+			return markCriticNoOutput(result);
+		}
 		console.error(
 			`  [${provider}] critic_no_output suspected (<${CRITIC_NO_VERDICT_CHAR_LIMIT} chars, no verdict/findings); retrying once after ${CRITIC_NO_VERDICT_RETRY_DELAY_MS / 1000}s...`,
 		);
 		await delay(CRITIC_NO_VERDICT_RETRY_DELAY_MS);
-		const retryResult = await spawnCriticOnce(provider, config, prompt, timeoutMs);
+		const retryResult = await spawnCriticOnce(
+			provider,
+			openCodeDeadline ? { ...config, minTimeout: 0 } : config,
+			prompt,
+			openCodeDeadline ? openCodeDeadline - Date.now() : timeoutMs,
+		);
 		if (isCriticNoVerdict(retryResult.output || "")) {
 			console.error(`  [${provider}] critic_no_output — excluded from tallies (not a BLOCK)`);
 			return markCriticNoOutput(retryResult);
@@ -3703,6 +3839,18 @@ function toLogMetadata(logData) {
 	return meta;
 }
 
+function toCriticLogMetadata(c) {
+	return {
+		provider: c.provider,
+		ok: c.ok,
+		durationMs: c.durationMs,
+		error: c.error,
+		pass2Fallback: c.pass2Fallback ?? false,
+		...(c.reason ? { reason: c.reason, stepFinishReason: c.stepFinishReason, tokens: c.tokens } : {}),
+		...(c.recovered ? { recovered: c.recovered } : {}),
+	};
+}
+
 function writeLog(logData) {
 	try {
 		const mainRoot = getMainWorktreeRoot();
@@ -4319,13 +4467,7 @@ async function main() {
 		diffLines,
 		excludedDiffPaths: COUNCIL_CONFIG.excludeDiffPaths,
 		diffBodyBytes: diffParts.diffBodyBytes,
-		phase1: result.phase1.map((c) => ({
-			provider: c.provider,
-			ok: c.ok,
-			durationMs: c.durationMs,
-			error: c.error,
-			pass2Fallback: c.pass2Fallback ?? false,
-		})),
+		phase1: result.phase1.map(toCriticLogMetadata),
 		phase2: {
 			provider: "judge",
 			ok: result.phase2.ok,
@@ -4475,6 +4617,8 @@ export {
 	getFullDiff,
 	getMainWorktreeRoot,
 	getOpenCodePreflightConfig,
+	hasRecoveredCriticVerdict,
+	inspectOpenCodeEvents,
 	getProviderConfig,
 	getSpecializationBlock,
 	getTierRoute,
@@ -4506,6 +4650,7 @@ export {
 	parseVerdict,
 	preflightLocalModel,
 	probeCriticAuth,
+	recoverOpenCodeLength,
 	reanchorCriticVerdict,
 	removeDisposableWorkspace,
 	resolveBuiltInBinary,
@@ -4525,6 +4670,7 @@ export {
 	tallyDebateFindings,
 	TIMEOUT_SECONDS,
 	toLogMetadata,
+	toCriticLogMetadata,
 	writeLog,
 	writeConsultLog,
 	writeCouncilMemory,
