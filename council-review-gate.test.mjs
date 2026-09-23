@@ -13,6 +13,8 @@ import {
 	buildRebuttalPrompt,
 	claudeNeedsShell,
 	getProviderConfig,
+	hasRecoveredCriticVerdict,
+	inspectOpenCodeEvents,
 	getSpecializationBlock,
 	isJudgeAuthFailure,
 	isJudgeTransientFailure,
@@ -25,6 +27,7 @@ import {
 	parseRebuttalVotes,
 	parseVerdict,
 	preflightLocalModel,
+	recoverOpenCodeLength,
 	reanchorCriticVerdict,
 	resolveLocalModelConfig,
 	resolveJudgeTools,
@@ -32,6 +35,8 @@ import {
 	synthesizeFromCritics,
 	tallyDebateFindings,
 	toLogMetadata,
+	toCriticLogMetadata,
+	writeLog,
 	writeConsultLog,
 } from "./council-review-gate.mjs";
 
@@ -49,6 +54,101 @@ const SYNTHETIC_ALLOW_REPORT = readFileSync(
 	),
 	"utf8",
 );
+
+const OPENCODE_LENGTH_EVENTS = readFileSync(
+	new URL("./test-fixtures/council-review-gate/opencode-reasoning-exhausted.ndjson", import.meta.url),
+	"utf8",
+);
+
+describe("OpenCode reasoning exhaustion recovery", () => {
+	const first = {
+		provider: "opencode", ok: true, output: "", error: null,
+		durationMs: 100, rawOutput: OPENCODE_LENGTH_EVENTS,
+	};
+	const config = getProviderConfig("opencode", "review");
+	const valid = "ALLOW: no security issue found\nNo findings.";
+	const help = "--session session id\n--variant model variant";
+
+	it("classifies the last length finish and keeps its token counts", () => {
+		expect(inspectOpenCodeEvents(OPENCODE_LENGTH_EVENTS)).toMatchObject({
+			reason: "reasoning_exhausted", stepFinishReason: "length",
+			tokens: { reasoning: 32000, output: 0 }, sessionID: "ses_fixture",
+		});
+		expect(inspectOpenCodeEvents(`${OPENCODE_LENGTH_EVENTS}{"type":"text","part":{"text":"answer"}}`)).toBeNull();
+		expect(inspectOpenCodeEvents(`{"type":"text","part":{"text":"earlier step"}}\n${OPENCODE_LENGTH_EVENTS}`)?.reason).toBe("reasoning_exhausted");
+		expect(inspectOpenCodeEvents('{"type":"step_finish","part":{"reason":"stop"}}')).toBeNull();
+	});
+
+	it("continues the same session once, accepts a parsed verdict, and writes recovery metadata", async () => {
+		let calls = 0;
+		const recovered = await recoverOpenCodeLength(
+			config, "original diff", first, Date.now() + 10_000,
+			async (_provider, recoveryConfig, prompt, budget) => {
+				calls++;
+				expect(recoveryConfig.args).toContain("--session");
+				expect(recoveryConfig.args).toContain("ses_fixture");
+				expect(recoveryConfig.args).not.toContain("--variant");
+				expect(recoveryConfig.promptAsTempFile).toBe(false);
+				expect(prompt).toContain("Write the findings and the verdict now");
+				expect(budget).toBeGreaterThan(0);
+				return { provider: "opencode", ok: true, output: valid, durationMs: 50, rawOutput: "recovered" };
+			},
+			async () => help,
+		);
+		expect(calls).toBe(1);
+		expect(recovered).toMatchObject({
+			ok: true, output: valid, recovered: "reasoning_exhausted", reason: "reasoning_exhausted",
+			tokens: { reasoning: 32000, output: 0 }, durationMs: 150,
+		});
+		expect(hasRecoveredCriticVerdict(valid)).toBe(true);
+		const runDir = writeLog({ phase1: [toCriticLogMetadata(recovered)], criticFullOutputs: [recovered] });
+		try {
+			const meta = JSON.parse(readFileSync(path.join(runDir, "meta.json"), "utf8"));
+			expect(meta.phase1[0]).toMatchObject({
+				recovered: "reasoning_exhausted", reason: "reasoning_exhausted",
+				stepFinishReason: "length", tokens: { reasoning: 32000, output: 0 },
+			});
+		} finally {
+			rmSync(runDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps an empty or unparseable recovery as ERROR", async () => {
+		for (const output of ["", "ALLOW: no issues"]) {
+			const result = await recoverOpenCodeLength(
+				config, "original diff", first, Date.now() + 10_000,
+				async () => ({ provider: "opencode", ok: true, output, durationMs: 20 }),
+				async () => help,
+			);
+			expect(result.ok).toBe(false);
+			expect(result.reason).toBe("reasoning_exhausted");
+			expect(result.recovered).toBeUndefined();
+		}
+		expect(hasRecoveredCriticVerdict("ALLOW: no issues\nNo findings.")).toBe(true);
+	});
+
+	it("uses one fresh run with the diff when session continuation is unavailable", async () => {
+		const result = await recoverOpenCodeLength(
+			config, "original diff", first, Date.now() + 10_000,
+			async (_provider, recoveryConfig, prompt) => {
+				expect(recoveryConfig.promptAsTempFile).toBe(true);
+				expect(recoveryConfig.buildArgs("/tmp/diff.md")).toContain("--variant");
+				expect(prompt).toBe("original diff");
+				return { provider: "opencode", ok: true, output: valid, durationMs: 20 };
+			},
+			async () => "--variant model variant",
+		);
+		expect(result.recovered).toBe("reasoning_exhausted");
+	});
+
+	it("does not recover a normal completion", async () => {
+		const normal = { ...first, output: valid, rawOutput: '{"type":"text","part":{"text":"ALLOW: clean"}}\n{"type":"step_finish","part":{"reason":"stop"}}' };
+		const result = await recoverOpenCodeLength(config, "diff", normal, Date.now() + 10_000,
+			async () => { throw new Error("recovery must not run"); },
+			async () => { throw new Error("help must not run"); });
+		expect(result).toBe(normal);
+	});
+});
 
 describe("omp adapter", () => {
 	it("uses an @file prompt, the review repository cwd, and the configured executable and model", () => {
