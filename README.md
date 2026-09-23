@@ -186,9 +186,12 @@ Exit codes are `0` for `ALLOW`, `1` for `BLOCK`, `2` for a harness error, and `3
 | `judgeCanExecute` | boolean | `true` | When `true`, CRITICAL-tier review grants the judge Bash access in a disposable worktree (see below). When `false`, CRITICAL uses the STANDARD tool set. Teams that don't want a model executing anything can turn this off and keep search-only verification. |
 | `timeoutSeconds` | integer | `300` | Base critic wall-clock timeout. Built-in adapters may enforce a larger minimum. |
 | `judgeTimeoutSeconds` | integer | `360` | Judge wall-clock timeout. Doubled to 2× when the judge runs at the Bash tier (CRITICAL + `judgeCanExecute: true`), because verification takes longer than reading. |
-| `maxDiffBytes` | integer | `200000` | Maximum diff bytes placed directly in critic prompts before truncation. |
+| `maxDiffBytes` | integer | `200000` | Maximum reviewable diff body bytes placed directly in critic prompts before truncation. |
+| `excludeDiffPaths` | string[] | generated paths (below) | Additional gitignore-style globs whose diff bodies are omitted. |
 | `logDir` | string | `".reviewteam/review-logs"` | Repository-relative directory for run artifacts and the run lock. |
 | `memoryDir` | string | `".reviewteam/memory"` | Repository-relative directory for learned false-positive memories. |
+
+`excludeDiffPaths` extends the built-in list: `**/migrations/meta/*_snapshot.json`, `**/migrations/meta/_journal.json`, `pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`, `Cargo.lock`, `**/*.min.js`, `**/*.min.css`, and `**/catalog-expectation*.json`. These generated bodies are omitted from critic prompts and the diff byte limit, but their names and numstat remain visible under `[GENERATED FILES (bodies omitted)]`; all changed paths still participate in tier routing. The run's `meta.json` records the applied patterns as `excludedDiffPaths` and the remaining body size in bytes as `diffBodyBytes`.
 
 ### `pathTierRules`
 

@@ -705,32 +705,51 @@ function detectBaseBranch() {
 	return "main";
 }
 
-function getFullDiff(base) {
+function getDiffParts(base) {
 	const mergeBase = gitSafe("merge-base", base, "HEAD") || base;
-	// Deleted files contribute nothing reviewable but can dwarf the real change (e.g. untracking logs):
-	// exclude their bodies and list them by name instead.
-	const deleted = gitSafe("diff", "--name-only", "--diff-filter=D", mergeBase, "HEAD");
-	const body = git("diff", "--diff-filter=d", mergeBase, "HEAD");
-	const diff = deleted?.trim()
-		? `[DELETED FILES (bodies omitted)]\n${deleted.trim()}\n\n${body}`
-		: body;
-
-	if (diff.length > MAX_DIFF_BYTES) {
-		const statSummary = git("diff", "--stat", mergeBase, "HEAD");
-		return (
-			`[TRUNCATED: diff is ${diff.length} bytes, showing first ${MAX_DIFF_BYTES} bytes]\n\n` +
-			`Full diff stat:\n${statSummary}\n\n` +
-			diff.slice(0, MAX_DIFF_BYTES)
-		);
-	}
-	return diff;
+	const range = [mergeBase, "HEAD"];
+	const deletedFiles = gitSafe("diff", "--name-only", "--diff-filter=D", ...range)
+		?.split(/\r?\n/).filter(Boolean) || [];
+	// A basename pattern follows gitignore convention and matches at any directory depth.
+	const patterns = COUNCIL_CONFIG.excludeDiffPaths.map((pattern) =>
+		pattern.includes("/") ? pattern : `**/${pattern}`,
+	);
+	const matched = patterns.length
+		? git("diff", "--name-only", ...range, "--", ...patterns.map((pattern) => `:(glob)${pattern}`))
+				.split(/\r?\n/).filter(Boolean)
+		: [];
+	const excludedFiles = matched.filter((file) => !deletedFiles.includes(file));
+	const exclusions = excludedFiles.map((file) => `:(exclude,literal)${file}`);
+	const diffArgs = [...range, "--", ".", ...exclusions];
+	const body = git("diff", "--diff-filter=d", ...diffArgs);
+	const diffBodyBytes = Buffer.byteLength(body, "utf8");
+	const generatedNumstat = excludedFiles.length
+		? git("diff", "--numstat", ...range, "--", ...excludedFiles.map((file) => `:(literal)${file}`))
+		: "";
+	const headers = [
+		...(deletedFiles.length ? [`[DELETED FILES (bodies omitted)]\n${deletedFiles.join("\n")}`] : []),
+		...(excludedFiles.length ? [`[GENERATED FILES (bodies omitted)]\n${generatedNumstat}`] : []),
+	];
+	return { body, diffBodyBytes, excludedFiles, headers, diffArgs };
 }
 
-function getTierRoute(base, tierOverride) {
-	const mergeBase = gitSafe("merge-base", base, "HEAD") || base;
-	const fullDiff = git("diff", mergeBase, "HEAD");
-	const diffStat = git("diff", "--numstat", mergeBase, "HEAD");
-	const changedFiles = git("diff", "--name-only", mergeBase, "HEAD").split(/\r?\n/).filter(Boolean);
+function getFullDiff(base, parts = getDiffParts(base)) {
+	const prefix = parts.headers.length ? `${parts.headers.join("\n\n")}\n\n` : "";
+	if (parts.diffBodyBytes > MAX_DIFF_BYTES) {
+		const statSummary = git("diff", "--stat", ...parts.diffArgs);
+		return (
+			`${prefix}[TRUNCATED: diff body is ${parts.diffBodyBytes} bytes, showing first ${MAX_DIFF_BYTES} bytes]\n\n` +
+			`Reviewable diff stat:\n${statSummary}\n\n` +
+			Buffer.from(parts.body, "utf8").subarray(0, MAX_DIFF_BYTES).toString("utf8")
+		);
+	}
+	return `${prefix}${parts.body}`;
+}
+
+function getTierRoute(base, tierOverride, parts = getDiffParts(base)) {
+	const fullDiff = parts.body;
+	const diffStat = git("diff", "--numstat", ...parts.diffArgs);
+	const changedFiles = git("diff", "--name-only", ...parts.diffArgs.slice(0, 2)).split(/\r?\n/).filter(Boolean);
 	return applyTierOverride(
 		routeTier(diffStat, changedFiles, fullDiff, COUNCIL_CONFIG.pathTierRules),
 		tierOverride,
@@ -801,8 +820,8 @@ function buildTaskPrompt(branchInfo, provider = null) {
 		"You are a pre-PR code review gate.",
 		projectContext,
 		"",
-		"Review the FULL git diff below for shipping blockers.",
-		"This diff represents ALL changes on this branch — not a single turn, but the complete body of work.",
+		"Review the git diff below for shipping blockers across the complete branch.",
+		"Generated and deleted file bodies may be omitted; their paths and generated-file numstat are listed in headers.",
 		"",
 		`Branch: ${branchInfo.branch}`,
 		`Last commit: ${branchInfo.lastCommit}`,
@@ -869,9 +888,27 @@ function buildTaskPrompt(branchInfo, provider = null) {
 	return `${basePrompt}${getSpecializationBlock(provider)}\n${jsonBlock}`;
 }
 
+/**
+ * Critic prompt files live INSIDE the reviewed repository (`<logDir's parent>/tmp/`, which the log
+ * directory convention already keeps out of version control), not in the OS temp dir. A critic CLI
+ * that runs non-interactively (opencode's read-only plan agent) shows the model a truncated excerpt
+ * of an attached file and lets it re-read the file only inside the project; from the OS temp dir
+ * that read is refused, the critic answers with a one-line plan, and the harness drops the seat as
+ * `critic_no_output`. Falls back to the OS temp dir when the project directory is not writable.
+ */
+function critTempDir() {
+	const local = path.join(process.cwd(), path.dirname(COUNCIL_CONFIG.logDir), "tmp");
+	try {
+		mkdirSync(local, { recursive: true });
+		return local;
+	} catch {
+		return tmpdir();
+	}
+}
+
 function writeTempFile(content, suffix = ".txt") {
 	const tempPath = path.join(
-		tmpdir(),
+		critTempDir(),
 		`council-critic-${Date.now()}-${Math.random().toString(36).slice(2)}${suffix}`,
 	);
 	writeFileSync(tempPath, content, "utf8");
@@ -4190,7 +4227,11 @@ async function main() {
 
 	process.stderr.write(`Council review gate: diffing against ${base}\n`);
 
-	const diff = getFullDiff(base);
+	const diffParts = getDiffParts(base);
+	process.stderr.write(
+		`Council review gate: generated bodies omitted: ${diffParts.excludedFiles.join(", ") || "(none)"}\n`,
+	);
+	const diff = getFullDiff(base, diffParts);
 	if (!diff.trim()) {
 		process.stderr.write("Council review gate: no diff — skipping.\n");
 		process.exit(0);
@@ -4203,7 +4244,7 @@ async function main() {
 		`Council review gate: ${diffLines} diff lines, branch=${branchInfo.branch}\n`,
 	);
 
-	const tierRoute = getTierRoute(base, opts.tier ?? process.env.COUNCIL_TIER);
+	const tierRoute = getTierRoute(base, opts.tier ?? process.env.COUNCIL_TIER, diffParts);
 	const tierDepth = resolveTierReviewDepth(tierRoute.tier);
 	process.stderr.write(`${tierDepth.header}\n`);
 	if (tierRoute.warning) {
@@ -4276,6 +4317,8 @@ async function main() {
 		debate: result.debate.enabled,
 		debateTallies: result.debate.tallies,
 		diffLines,
+		excludedDiffPaths: COUNCIL_CONFIG.excludeDiffPaths,
+		diffBodyBytes: diffParts.diffBodyBytes,
 		phase1: result.phase1.map((c) => ({
 			provider: c.provider,
 			ok: c.ok,
@@ -4428,6 +4471,7 @@ export {
 	extractStructuredFindings,
 	FULL_COUNCIL_CRITICS,
 	getBranchInfo,
+	getDiffParts,
 	getFullDiff,
 	getMainWorktreeRoot,
 	getOpenCodePreflightConfig,
@@ -4481,6 +4525,7 @@ export {
 	tallyDebateFindings,
 	TIMEOUT_SECONDS,
 	toLogMetadata,
+	writeLog,
 	writeConsultLog,
 	writeCouncilMemory,
 	writeTempFile,
