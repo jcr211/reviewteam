@@ -1182,8 +1182,14 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 				"text",
 				"--settings",
 				CLEAN_SETTINGS_PATH,
+				// A critic gets no tools: the diff in the prompt is its whole input. At max effort a
+				// model still ATTEMPTS tool calls even when none are offered, and each refused attempt
+				// costs a turn — Haiku 5.5 needed 3–4 turns for one tool-less verdict (2026-10-08), so
+				// `--max-turns 1` produced critic_no_output on every run.
+				"--tools",
+				"",
 				"--max-turns",
-				"1",
+				process.env.CLAUDE_CRITIC_MAX_TURNS || "6",
 			],
 			useStdin: true,
 			useTempFile: false,
