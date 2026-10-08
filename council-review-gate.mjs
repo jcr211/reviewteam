@@ -1177,7 +1177,8 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 				"--model",
 				options.modelOverride || process.env.CLAUDE_CRITIC_MODEL || JUDGE_MODEL,
 				"--effort",
-				"max",
+				// Sonnet 5.5 at max effort still burned 7 turns on tool attempts; at high it answers in one.
+				process.env.CLAUDE_CRITIC_EFFORT || "max",
 				"--output-format",
 				"text",
 				"--settings",
