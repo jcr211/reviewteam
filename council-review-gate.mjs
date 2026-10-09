@@ -1058,7 +1058,14 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 			// GROK_BIN: env override, else ~/.grok/bin/grok.exe (standard install), else bare `grok`.
 			cmd: GROK_BIN,
 			// Pin optional telemetry off at the harness layer instead of relying on vendor defaults.
-			env: { GROK_TELEMETRY_ENABLED: "0", GROK_TELEMETRY_TRACE_UPLOAD: "0" },
+			// GROK_CLAUDE_HOOKS_ENABLED=0: the grok CLI scans and runs Claude Code hooks by default
+			// (compat.claude.hooks). A host Stop hook (e.g. a git-hygiene check) then blocks every reply,
+			// so the critic loops to its turn limit and returns critic_no_output (paid 2026-10-08).
+			env: {
+				GROK_TELEMETRY_ENABLED: "0",
+				GROK_TELEMETRY_TRACE_UPLOAD: "0",
+				GROK_CLAUDE_HOOKS_ENABLED: "0",
+			},
 			args: [],
 			useStdin: false,
 			useTempFile: true,
