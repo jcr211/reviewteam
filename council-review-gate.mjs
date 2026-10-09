@@ -1091,8 +1091,10 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 				"run_terminal_command,search_replace,spawn_subagent,use_tool,workflow,search_tool",
 				// NO --effort: grok-4.7 accepts reasoningEffort; we still omit it for safety — revisit
 				// before re-adding because the old grok-composer path 400ed and caused empty verdicts.
+				// 15 turns ran out while grok-4.7 re-read a large prompt file in chunks (critic_no_output,
+				// "Max turns reached", 2026-10-08); 40 leaves room to read the whole diff and answer.
 				"--max-turns",
-				"15",
+				process.env.GROK_CRITIC_MAX_TURNS || "40",
 			],
 			// Reanchoring is a review-mode verdict normalizer. Consult prompts forbid an approval
 			// verdict and expect an unmodified advisory, so in consult mode pass the output through
