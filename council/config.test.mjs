@@ -48,7 +48,7 @@ describe("normalizeCouncilConfig", () => {
 
 	it("rejects the removed qwencode adapter with migration guidance", () => {
 		expect(() => normalizeCouncilConfig({ critics: ["qwencode"] })).toThrow(
-			'unknown critic id(s): "qwencode". Valid built-in adapters: claude, codex, grok, omp, opencode. Define custom CLIs in "criticCommands".',
+			'unknown critic id(s): "qwencode". Valid built-in adapters: claude, codex, grok, omp, opencode, pi. Define custom CLIs in "criticCommands".',
 		);
 	});
 

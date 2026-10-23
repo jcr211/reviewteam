@@ -70,6 +70,7 @@ Five adapters ship built in. Each shells out to a CLI you install and authentica
 | `grok` | `grok` | `grok-4.7` | `GROK_BIN`, `GROK_COUNCIL_MODEL` |
 | `opencode` | `opencode` | `opencode-go/deepseek-v4.1-flash` | `OPENCODE_COUNCIL_MODEL` |
 | `omp` | `omp` | omp's configured model | `OMP_BIN`, `OMP_COUNCIL_MODEL` |
+| `pi` | `pi` | `opencode-go/deepseek-v4.1-flash` | `PI_BIN`, `PI_COUNCIL_MODEL` |
 
 CLI version floors for these defaults: `gpt-6-sol` needs a Codex CLI newer than 0.144 (older builds answer
 `400 … model is not supported when using Codex with a ChatGPT account`), and the `claude-opus-5-5` judge needs Claude

@@ -189,6 +189,9 @@ const OPENCODE_PS1 =
 // family, and critics from different families miss different defects.
 const OPENCODE_COUNCIL_MODEL =
 	process.env.OPENCODE_COUNCIL_MODEL || "opencode-go/deepseek-v4.1-flash";
+// Second-family critic through Pi (James, 2026-10-23: OpenCode-Go models run through Pi, never
+// `/login` in Pi — the ocgo rotation owns the key). Same model as the opencode seat, different CLI.
+const PI_COUNCIL_MODEL = process.env.PI_COUNCIL_MODEL || "opencode-go/deepseek-v4.1-flash";
 const STD_GROK_BIN = path.join(
 	homedir(),
 	".grok",
@@ -205,6 +208,7 @@ function resolveBuiltInBinary(provider) {
 	if (normalized === "grok" || normalized === "grokcli") return GROK_BIN;
 	if (normalized === "opencode") return OPENCODE_PS1;
 	if (normalized === "omp") return process.env.OMP_BIN || "omp";
+	if (normalized === "pi") return process.env.PI_BIN || "pi";
 	return null;
 }
 /**
@@ -607,6 +611,15 @@ const SPECIALIZATIONS = {
 			"- Boundary consistency: do public contracts, implementations, and environment configuration agree?",
 			"Deprioritize: formatting and naming unless they hide a correctness issue.",
 		],
+	},
+	pi: {
+		label: "Second-family generalist (whole-diff read)",
+		emphasis: [
+			"YOUR ROLE: an independent second-family reviewer. Read the whole diff as a senior engineer who will own this code and report every material defect you can point at: correctness, fail-open arms, authority taken from a caller instead of the screened artifact, tests that would pass with the guard removed, and anything between components that is individually correct but wrong together.",
+			"You have NO shell and NO git: never run commands or inspect the working tree. The attached prompt file IS the complete review input.",
+			"Prioritize real, high-signal findings with file:line evidence over nitpicks. If nothing is wrong, say so plainly.",
+		],
+		reviewOnly: ["Severity-tag each finding P0/P1/P2/P3. Start your output with ALLOW or BLOCK."],
 	},
 	opencode: {
 		label: "Security Surface Analysis",
@@ -1016,6 +1029,33 @@ function buildOmpArgs(effectiveTimeoutMs, env = process.env, promptFilePath = nu
 	];
 }
 
+/**
+ * Pi critic seat: hermetic, read-only and prompt-only. `--no-tools` leaves the model with nothing
+ * to execute or fetch with, and every discovery path (extensions, skills, context files, prompt
+ * templates, themes) is off so reviewed code cannot steer or exfiltrate through the critic. Pi
+ * has no flag that lets it sign in here, and none may be added: the ocgo rotation owns the key.
+ */
+function buildPiArgs(env = process.env, promptFilePath = null, message = null) {
+	return [
+		"-p",
+		"--mode",
+		"text",
+		"--no-session",
+		"--no-tools",
+		"--no-extensions",
+		"--no-skills",
+		"--no-prompt-templates",
+		"--no-themes",
+		"--no-context-files",
+		"--model",
+		env.PI_COUNCIL_MODEL || PI_COUNCIL_MODEL,
+		"--thinking",
+		"medium",
+		...(promptFilePath ? [`@${promptFilePath}`] : []),
+		...(message ? [message] : []),
+	];
+}
+
 function getProviderConfig(provider, mode = "review", options = {}) {
 	const isConsult = mode === "consult";
 	const p = provider.toLowerCase().replace(/-/g, "");
@@ -1178,6 +1218,27 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 				: (stdout) => reanchorCriticVerdict(stdout),
 			minTimeout: 0,
 			cwd: process.cwd(),
+		};
+	}
+
+	if (p === "pi") {
+		const env = options.env ?? process.env;
+		const message = isConsult
+			? "Read the advisory task in the attached file and follow its instructions exactly. Output only your advisory response."
+			: "The attached file is the complete review task and diff; do not explore anything else or run commands. Analyze it and list every bug, security issue, and code quality problem you find, with file paths and line numbers.";
+		return {
+			cmd: env.PI_BIN || "pi",
+			args: buildPiArgs(env, null, message),
+			buildArgs: (tempFilePath) => buildPiArgs(env, tempFilePath, message),
+			useStdin: false,
+			useTempFile: true,
+			promptAsTempFile: true,
+			parseOutput: isConsult
+				? (stdout) => (stdout || "").trim()
+				: (stdout) => reanchorCriticVerdict(stdout),
+			minTimeout: 0,
+			cwd: process.cwd(),
+			model: env.PI_COUNCIL_MODEL || PI_COUNCIL_MODEL,
 		};
 	}
 
@@ -4621,6 +4682,7 @@ export {
 	buildReliabilityPromptSection,
 	buildLocalModelHeaders,
 	buildOmpArgs,
+	buildPiArgs,
 	buildOpusContext,
 	buildTaskPrompt,
 	claudeNeedsShell,

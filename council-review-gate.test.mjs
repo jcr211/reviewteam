@@ -6,6 +6,7 @@ import {
 	aggregateFindings,
 	aggregateDebateVotes,
 	buildOmpArgs,
+	buildPiArgs,
 	buildConsultCriticPrompt,
 	buildDebateJudgeSection,
 	buildJudgeInstructions,
@@ -147,6 +148,48 @@ describe("OpenCode reasoning exhaustion recovery", () => {
 			async () => { throw new Error("recovery must not run"); },
 			async () => { throw new Error("help must not run"); });
 		expect(result).toBe(normal);
+	});
+});
+
+describe("pi adapter (second-family DeepSeek seat)", () => {
+	it("runs Pi hermetic and read-only on the pinned DeepSeek model with the prompt as an @file", () => {
+		const config = getProviderConfig("pi", "review", { env: {} });
+		const promptFile = "/tmp/council-prompt.md";
+		const args = config.buildArgs(promptFile);
+
+		expect(config.cmd).toBe("pi");
+		expect(args.slice(0, 11)).toEqual([
+			"-p",
+			"--mode",
+			"text",
+			"--no-session",
+			"--no-tools",
+			"--no-extensions",
+			"--no-skills",
+			"--no-prompt-templates",
+			"--no-themes",
+			"--no-context-files",
+			"--model",
+		]);
+		expect(args[11]).toBe("opencode-go/deepseek-v4.1-flash");
+		expect(args).toContain(`@${promptFile}`);
+		expect(config.useStdin).toBe(false);
+		expect(config.promptAsTempFile).toBe(true);
+	});
+
+	it("never enables a tool or a sign-in path, whatever the environment says", () => {
+		const args = buildPiArgs({ PI_COUNCIL_MODEL: "opencode-go/other", PI_BIN: "/x/pi" }, "/tmp/p.md");
+		expect(args).toContain("--no-tools");
+		for (const forbidden of ["--tools", "-t", "--api-key", "--approve", "-a", "--login"]) {
+			expect(args).not.toContain(forbidden);
+		}
+		expect(args).toContain("opencode-go/other");
+	});
+
+	it("honours PI_BIN and reanchors the verdict so a late BLOCK is read, not a leading ALLOW", () => {
+		const config = getProviderConfig("pi", "review", { env: { PI_BIN: "/opt/pi-custom" } });
+		expect(config.cmd).toBe("/opt/pi-custom");
+		expect(config.parseOutput("ALLOW: first look\nA real hole.\nBLOCK: final").startsWith("BLOCK:")).toBe(true);
 	});
 });
 
@@ -960,7 +1003,7 @@ describe("writeConsultLog", () => {
 // Contaminated providers that have code-review framing in their buildArgs wrapper text.
 // In consult mode, none of their wrapper strings may contain review-specific terms.
 const REVIEW_TERMS = ["code review", "diff", "ALLOW", "BLOCK", "verdict", "shipping blocker"];
-const CONTAMINATED_PROVIDERS = ["omp", "grok", "opencode"];
+const CONTAMINATED_PROVIDERS = ["omp", "grok", "opencode", "pi"];
 
 describe("getProviderConfig consult mode — no code-review framing in wrapper text", () => {
 	for (const provider of CONTAMINATED_PROVIDERS) {
@@ -1013,7 +1056,7 @@ describe("getProviderConfig consult mode — twoPass disabled", () => {
 describe("consult mode does not reanchor advisory verdicts", () => {
 	const advisory = "Option A is safer.\nALLOW: prefer A here\nOption B trades speed for risk.";
 
-	for (const provider of ["omp", "grok"]) {
+	for (const provider of ["omp", "grok", "pi"]) {
 		it(`${provider}: consult parseOutput passes the advisory through untouched`, () => {
 			const config = getProviderConfig(provider, "consult");
 			expect(config.parseOutput(advisory)).toBe(advisory);

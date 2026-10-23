@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
-export const BUILT_IN_CRITICS = ["claude", "codex", "grok", "omp", "opencode"];
+export const BUILT_IN_CRITICS = ["claude", "codex", "grok", "omp", "opencode", "pi"];
 
 export const DEFAULT_CONFIG = {
 	projectName: "Your Project",
