@@ -7,6 +7,8 @@
 // Usage:
 //   node council-review-gate.mjs [--base <branch>] [--tier <tier>] [--debate|--no-debate] [--no-block] [--verbose]
 //   node council-review-gate.mjs --stats [--last <N>]   # health dashboard over recent runs
+//   node council-review-gate.mjs --route-only [--base <branch>] [--tier <tier>]
+//       # print {"base","tier","reasons"} as JSON and exit 0; runs no critic, takes no run lock
 //
 // Exit codes:
 //   0 = ALLOW (or --no-block mode)
@@ -691,6 +693,7 @@ function parseArgs(args = process.argv.slice(2)) {
 		consult: null,
 		topic: null,
 		tier: null,
+		routeOnly: false,
 		debate: args.includes("--no-debate") ? false : args.includes("--debate") ? true : null,
 	};
 	for (let i = 0; i < args.length; i++) {
@@ -702,6 +705,7 @@ function parseArgs(args = process.argv.slice(2)) {
 		else if (args[i] === "--consult" && args[i + 1]) opts.consult = args[++i];
 		else if (args[i] === "--topic" && args[i + 1]) opts.topic = args[++i];
 		else if (args[i] === "--tier" && args[i + 1]) opts.tier = args[++i];
+		else if (args[i] === "--route-only") opts.routeOnly = true;
 	}
 	return opts;
 }
@@ -4431,6 +4435,18 @@ async function main() {
 
 	if (opts.stats) {
 		process.exit(runStats(opts.statsLimit));
+	}
+
+	// The tier this diff would be reviewed at, with no critic launched and no run lock taken. A
+	// wrapper that picks a seat's model by tier (review-council.sh: GPT-6 Astra on CRITICAL) asks
+	// the harness rather than re-deriving the router's rules.
+	if (opts.routeOnly) {
+		const routeBase = opts.base || detectBaseBranch();
+		const route = getTierRoute(routeBase, opts.tier ?? process.env.COUNCIL_TIER);
+		process.stdout.write(
+			`${JSON.stringify({ base: routeBase, tier: route.tier, reasons: route.reasons })}\n`,
+		);
+		process.exit(0);
 	}
 
 	// One council at a time per repository prevents concurrent runs from competing for

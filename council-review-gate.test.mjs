@@ -1,6 +1,15 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
 	aggregateFindings,
@@ -1501,5 +1510,54 @@ describe("resolveJudgeTools", () => {
 
 	it("returns Read,Grep,Glob for CRITICAL with judgeCanExecute=false", () => {
 		expect(resolveJudgeTools("CRITICAL", false)).toEqual(["Read", "Grep", "Glob"]);
+	});
+});
+
+describe("--route-only (tier for a wrapper that picks a seat model by tier)", () => {
+	const gate = fileURLToPath(new URL("./council-review-gate.mjs", import.meta.url));
+	const run = (cwd, args, cmd = "node") =>
+		execFileSync(cmd, args, {
+			cwd,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+			env: {
+				...process.env,
+				GIT_AUTHOR_NAME: "t",
+				GIT_AUTHOR_EMAIL: "t@example.invalid",
+				GIT_COMMITTER_NAME: "t",
+				GIT_COMMITTER_EMAIL: "t@example.invalid",
+			},
+		});
+	const git = (cwd, ...args) =>
+		run(cwd, ["-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main", ...args], "git");
+
+	it("prints the routed tier as JSON, runs no critic and leaves no run state behind", () => {
+		const dir = mkdtempSync(path.join(tmpdir(), "route-only-"));
+		try {
+			git(dir, "init", "-q");
+			writeFileSync(path.join(dir, "a.ts"), "export const a = 1;\n");
+			git(dir, "add", "-A");
+			git(dir, "commit", "-q", "-m", "base");
+			git(dir, "checkout", "-q", "-b", "work");
+			writeFileSync(path.join(dir, "a.ts"), "export const a = 2;\n");
+			git(dir, "commit", "-q", "-am", "ts change");
+			const standard = JSON.parse(run(dir, [gate, "--route-only", "--base", "main"]));
+			expect(standard.tier).toBe("STANDARD");
+			expect(standard.base).toBe("main");
+
+			mkdirSync(path.join(dir, "db"), { recursive: true });
+			writeFileSync(path.join(dir, "db", "x.sql"), "select 1;\n");
+			git(dir, "add", "-A");
+			git(dir, "commit", "-q", "-m", "sql change");
+			expect(JSON.parse(run(dir, [gate, "--route-only", "--base", "main"])).tier).toBe("CRITICAL");
+			expect(existsSync(path.join(dir, ".reviewteam"))).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("parseArgs sets routeOnly only when asked", () => {
+		expect(parseArgs(["--route-only"]).routeOnly).toBe(true);
+		expect(parseArgs([]).routeOnly).toBe(false);
 	});
 });
