@@ -7,6 +7,8 @@
 // Usage:
 //   node council-review-gate.mjs [--base <branch>] [--tier <tier>] [--debate|--no-debate] [--no-block] [--verbose]
 //   node council-review-gate.mjs --stats [--last <N>]   # health dashboard over recent runs
+//   node council-review-gate.mjs --route-only [--base <branch>] [--tier <tier>]
+//       # print {"base","tier","reasons"} as JSON and exit 0; runs no critic, takes no run lock
 //
 // Exit codes:
 //   0 = ALLOW (or --no-block mode)
@@ -51,6 +53,40 @@ const PHASE1_CRITICS = process.env.COUNCIL_CRITICS
 	: FULL_COUNCIL_CRITICS;
 const JUDGE_MODEL = COUNCIL_CONFIG.judgeModel;
 const GROK_COUNCIL_MODEL = process.env.GROK_COUNCIL_MODEL || "grok-4.7";
+// James, 2026-10-24 (ReviewTeam conservation roster): the judge seat is selectable by an explicit
+// COUNCIL_JUDGE=<provider>:<model> pin — the Codex judge on a standard review, Grok 4.7 on a
+// critical or integration one. Unset, every judge path keeps its configured Claude behaviour.
+export const APPROVED_JUDGE_SEATS = {
+	codex: ["gpt-6.1-sol"],
+	grok: ["grok-4.7"],
+};
+
+/**
+ * Resolve the COUNCIL_JUDGE pin. Unset/empty means the configured Claude judge (`judgeModel`), so
+ * an existing run is unchanged; any unapproved provider or model is an error the gate refuses.
+ */
+export function resolveJudgeSeat(raw = process.env.COUNCIL_JUDGE) {
+	const configured = { provider: "claude", model: JUDGE_MODEL, explicit: false };
+	if (raw === undefined || raw === null || String(raw).trim() === "") return configured;
+	const value = String(raw).trim();
+	const match = /^([a-z]+):(\S+)$/.exec(value);
+	const approved = match ? APPROVED_JUDGE_SEATS[match[1]] : undefined;
+	if (!approved?.includes(match[2])) {
+		return {
+			error: `COUNCIL_JUDGE=${value} is not an approved judge seat (approved: ${Object.entries(
+				APPROVED_JUDGE_SEATS,
+			)
+				.map(([provider, models]) => models.map((model) => `${provider}:${model}`).join(", "))
+				.join(", ")})`,
+		};
+	}
+	return { provider: match[1], model: match[2], explicit: true };
+}
+
+/** The judge seat this process runs under. Absent COUNCIL_JUDGE = the configured Claude judge. */
+export function getJudgeSeat() {
+	return resolveJudgeSeat(process.env.COUNCIL_JUDGE);
+}
 
 function stripTrailingV1(url) {
 	return url
@@ -189,6 +225,9 @@ const OPENCODE_PS1 =
 // family, and critics from different families miss different defects.
 const OPENCODE_COUNCIL_MODEL =
 	process.env.OPENCODE_COUNCIL_MODEL || "opencode-go/deepseek-v4.1-flash";
+// Second-family critic through Pi (James, 2026-10-23: OpenCode-Go models run through Pi, never
+// `/login` in Pi — the ocgo rotation owns the key). Same model as the opencode seat, different CLI.
+const PI_COUNCIL_MODEL = process.env.PI_COUNCIL_MODEL || "opencode-go/deepseek-v4.1-flash";
 const STD_GROK_BIN = path.join(
 	homedir(),
 	".grok",
@@ -205,6 +244,7 @@ function resolveBuiltInBinary(provider) {
 	if (normalized === "grok" || normalized === "grokcli") return GROK_BIN;
 	if (normalized === "opencode") return OPENCODE_PS1;
 	if (normalized === "omp") return process.env.OMP_BIN || "omp";
+	if (normalized === "pi") return process.env.PI_BIN || "pi";
 	return null;
 }
 /**
@@ -608,6 +648,15 @@ const SPECIALIZATIONS = {
 			"Deprioritize: formatting and naming unless they hide a correctness issue.",
 		],
 	},
+	pi: {
+		label: "Second-family generalist (whole-diff read)",
+		emphasis: [
+			"YOUR ROLE: an independent second-family reviewer. Read the whole diff as a senior engineer who will own this code and report every material defect you can point at: correctness, fail-open arms, authority taken from a caller instead of the screened artifact, tests that would pass with the guard removed, and anything between components that is individually correct but wrong together.",
+			"You have NO shell and NO git: never run commands or inspect the working tree. The attached prompt file IS the complete review input.",
+			"Prioritize real, high-signal findings with file:line evidence over nitpicks. If nothing is wrong, say so plainly.",
+		],
+		reviewOnly: ["Severity-tag each finding P0/P1/P2/P3. Start your output with ALLOW or BLOCK."],
+	},
 	opencode: {
 		label: "Security Surface Analysis",
 		emphasis: [
@@ -678,6 +727,7 @@ function parseArgs(args = process.argv.slice(2)) {
 		consult: null,
 		topic: null,
 		tier: null,
+		routeOnly: false,
 		debate: args.includes("--no-debate") ? false : args.includes("--debate") ? true : null,
 	};
 	for (let i = 0; i < args.length; i++) {
@@ -689,6 +739,7 @@ function parseArgs(args = process.argv.slice(2)) {
 		else if (args[i] === "--consult" && args[i + 1]) opts.consult = args[++i];
 		else if (args[i] === "--topic" && args[i + 1]) opts.topic = args[++i];
 		else if (args[i] === "--tier" && args[i + 1]) opts.tier = args[++i];
+		else if (args[i] === "--route-only") opts.routeOnly = true;
 	}
 	return opts;
 }
@@ -705,32 +756,51 @@ function detectBaseBranch() {
 	return "main";
 }
 
-function getFullDiff(base) {
+function getDiffParts(base) {
 	const mergeBase = gitSafe("merge-base", base, "HEAD") || base;
-	// Deleted files contribute nothing reviewable but can dwarf the real change (e.g. untracking logs):
-	// exclude their bodies and list them by name instead.
-	const deleted = gitSafe("diff", "--name-only", "--diff-filter=D", mergeBase, "HEAD");
-	const body = git("diff", "--diff-filter=d", mergeBase, "HEAD");
-	const diff = deleted?.trim()
-		? `[DELETED FILES (bodies omitted)]\n${deleted.trim()}\n\n${body}`
-		: body;
-
-	if (diff.length > MAX_DIFF_BYTES) {
-		const statSummary = git("diff", "--stat", mergeBase, "HEAD");
-		return (
-			`[TRUNCATED: diff is ${diff.length} bytes, showing first ${MAX_DIFF_BYTES} bytes]\n\n` +
-			`Full diff stat:\n${statSummary}\n\n` +
-			diff.slice(0, MAX_DIFF_BYTES)
-		);
-	}
-	return diff;
+	const range = [mergeBase, "HEAD"];
+	const deletedFiles = gitSafe("diff", "--name-only", "--diff-filter=D", ...range)
+		?.split(/\r?\n/).filter(Boolean) || [];
+	// A basename pattern follows gitignore convention and matches at any directory depth.
+	const patterns = COUNCIL_CONFIG.excludeDiffPaths.map((pattern) =>
+		pattern.includes("/") ? pattern : `**/${pattern}`,
+	);
+	const matched = patterns.length
+		? git("diff", "--name-only", ...range, "--", ...patterns.map((pattern) => `:(glob)${pattern}`))
+				.split(/\r?\n/).filter(Boolean)
+		: [];
+	const excludedFiles = matched.filter((file) => !deletedFiles.includes(file));
+	const exclusions = excludedFiles.map((file) => `:(exclude,literal)${file}`);
+	const diffArgs = [...range, "--", ".", ...exclusions];
+	const body = git("diff", "--diff-filter=d", ...diffArgs);
+	const diffBodyBytes = Buffer.byteLength(body, "utf8");
+	const generatedNumstat = excludedFiles.length
+		? git("diff", "--numstat", ...range, "--", ...excludedFiles.map((file) => `:(literal)${file}`))
+		: "";
+	const headers = [
+		...(deletedFiles.length ? [`[DELETED FILES (bodies omitted)]\n${deletedFiles.join("\n")}`] : []),
+		...(excludedFiles.length ? [`[GENERATED FILES (bodies omitted)]\n${generatedNumstat}`] : []),
+	];
+	return { body, diffBodyBytes, excludedFiles, headers, diffArgs };
 }
 
-function getTierRoute(base, tierOverride) {
-	const mergeBase = gitSafe("merge-base", base, "HEAD") || base;
-	const fullDiff = git("diff", mergeBase, "HEAD");
-	const diffStat = git("diff", "--numstat", mergeBase, "HEAD");
-	const changedFiles = git("diff", "--name-only", mergeBase, "HEAD").split(/\r?\n/).filter(Boolean);
+function getFullDiff(base, parts = getDiffParts(base)) {
+	const prefix = parts.headers.length ? `${parts.headers.join("\n\n")}\n\n` : "";
+	if (parts.diffBodyBytes > MAX_DIFF_BYTES) {
+		const statSummary = git("diff", "--stat", ...parts.diffArgs);
+		return (
+			`${prefix}[TRUNCATED: diff body is ${parts.diffBodyBytes} bytes, showing first ${MAX_DIFF_BYTES} bytes]\n\n` +
+			`Reviewable diff stat:\n${statSummary}\n\n` +
+			Buffer.from(parts.body, "utf8").subarray(0, MAX_DIFF_BYTES).toString("utf8")
+		);
+	}
+	return `${prefix}${parts.body}`;
+}
+
+function getTierRoute(base, tierOverride, parts = getDiffParts(base)) {
+	const fullDiff = parts.body;
+	const diffStat = git("diff", "--numstat", ...parts.diffArgs);
+	const changedFiles = git("diff", "--name-only", ...parts.diffArgs.slice(0, 2)).split(/\r?\n/).filter(Boolean);
 	return applyTierOverride(
 		routeTier(diffStat, changedFiles, fullDiff, COUNCIL_CONFIG.pathTierRules),
 		tierOverride,
@@ -801,8 +871,8 @@ function buildTaskPrompt(branchInfo, provider = null) {
 		"You are a pre-PR code review gate.",
 		projectContext,
 		"",
-		"Review the FULL git diff below for shipping blockers.",
-		"This diff represents ALL changes on this branch — not a single turn, but the complete body of work.",
+		"Review the git diff below for shipping blockers across the complete branch.",
+		"Generated and deleted file bodies may be omitted; their paths and generated-file numstat are listed in headers.",
 		"",
 		`Branch: ${branchInfo.branch}`,
 		`Last commit: ${branchInfo.lastCommit}`,
@@ -869,9 +939,27 @@ function buildTaskPrompt(branchInfo, provider = null) {
 	return `${basePrompt}${getSpecializationBlock(provider)}\n${jsonBlock}`;
 }
 
+/**
+ * Critic prompt files live INSIDE the reviewed repository (`<logDir's parent>/tmp/`, which the log
+ * directory convention already keeps out of version control), not in the OS temp dir. A critic CLI
+ * that runs non-interactively (opencode's read-only plan agent) shows the model a truncated excerpt
+ * of an attached file and lets it re-read the file only inside the project; from the OS temp dir
+ * that read is refused, the critic answers with a one-line plan, and the harness drops the seat as
+ * `critic_no_output`. Falls back to the OS temp dir when the project directory is not writable.
+ */
+function critTempDir() {
+	const local = path.join(process.cwd(), path.dirname(COUNCIL_CONFIG.logDir), "tmp");
+	try {
+		mkdirSync(local, { recursive: true });
+		return local;
+	} catch {
+		return tmpdir();
+	}
+}
+
 function writeTempFile(content, suffix = ".txt") {
 	const tempPath = path.join(
-		tmpdir(),
+		critTempDir(),
 		`council-critic-${Date.now()}-${Math.random().toString(36).slice(2)}${suffix}`,
 	);
 	writeFileSync(tempPath, content, "utf8");
@@ -895,7 +983,36 @@ function parseNdjsonOpencode(stdout) {
 	return parts.join("");
 }
 
-function buildOpenCodeArgs(prompt, promptFilePath = null, model = OPENCODE_COUNCIL_MODEL) {
+function inspectOpenCodeEvents(stdout) {
+	let sessionID = null;
+	let lastFinish = null;
+	let finalText = "";
+	for (const line of (stdout || "").split("\n")) {
+		if (!line.trim()) continue;
+		let event;
+		try {
+			event = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (event.sessionID) sessionID = event.sessionID;
+		if (event.type === "step_start") finalText = "";
+		if (event.type === "text") finalText += event.part?.text || "";
+		if (event.type === "step_finish") lastFinish = event;
+	}
+	if (lastFinish?.part?.reason !== "length" || finalText.trim()) return null;
+	return {
+		reason: "reasoning_exhausted",
+		stepFinishReason: "length",
+		tokens: {
+			reasoning: lastFinish.part.tokens?.reasoning ?? null,
+			output: lastFinish.part.tokens?.output ?? null,
+		},
+		sessionID: lastFinish.sessionID || sessionID,
+	};
+}
+
+function buildOpenCodeArgs(prompt, promptFilePath = null, model = OPENCODE_COUNCIL_MODEL, runOptions = []) {
 	// Read-only plan agent avoids TTY-less permission hangs without granting mutating tools.
 	// The preflight uses the same read-only execution path as a real critic run.
 	return [
@@ -908,6 +1025,7 @@ function buildOpenCodeArgs(prompt, promptFilePath = null, model = OPENCODE_COUNC
 		"plan",
 		"--model",
 		model,
+		...runOptions,
 		prompt,
 		...(promptFilePath ? ["-f", promptFilePath] : []),
 	];
@@ -947,6 +1065,62 @@ function buildOmpArgs(effectiveTimeoutMs, env = process.env, promptFilePath = nu
 		...(env.OMP_COUNCIL_MODEL ? ["--model", env.OMP_COUNCIL_MODEL] : []),
 		...(promptFilePath ? [`@${promptFilePath}`] : []),
 	];
+}
+
+/**
+ * Pi critic seat: hermetic, read-only and prompt-only. `--no-tools` leaves the model with nothing
+ * to execute or fetch with, and every discovery path (extensions, skills, context files, prompt
+ * templates, themes) is off so reviewed code cannot steer or exfiltrate through the critic. Pi
+ * has no flag that lets it sign in here, and none may be added: the ocgo rotation owns the key.
+ */
+function buildPiArgs(env = process.env, promptFilePath = null, message = null) {
+	return [
+		"-p",
+		"--mode",
+		"text",
+		"--no-session",
+		"--no-tools",
+		"--no-extensions",
+		"--no-skills",
+		"--no-prompt-templates",
+		"--no-themes",
+		"--no-context-files",
+		"--model",
+		env.PI_COUNCIL_MODEL || PI_COUNCIL_MODEL,
+		"--thinking",
+		"medium",
+		...(promptFilePath ? [`@${promptFilePath}`] : []),
+		...(message ? [message] : []),
+	];
+}
+
+/** The codex CLI invocation shared by the codex critic and the codex judge seat. */
+function buildCodexExecArgs(model) {
+	return [
+		"exec",
+		"-m",
+		model,
+		"-c",
+		// CODEX_COUNCIL_EFFORT: low|medium|high|xhigh (default high). Large diffs at high can exceed the 600s seat timeout.
+		`model_reasoning_effort=${process.env.CODEX_COUNCIL_EFFORT || "high"}`,
+		"--sandbox",
+		"read-only",
+		"--skip-git-repo-check",
+	];
+}
+
+/**
+ * The isolated environment every grok seat runs in: telemetry off and a dedicated profile
+ * (GROK_CRITIC_HOME, default ~/.grok-critic: auth symlinked to ~/.grok, compat off, requirements.toml
+ * `allow_managed_hooks_only = true`) so no host hook can run and block the reply.
+ */
+function grokSeatEnv() {
+	return {
+		GROK_TELEMETRY_ENABLED: "0",
+		GROK_TELEMETRY_TRACE_UPLOAD: "0",
+		GROK_CLAUDE_HOOKS_ENABLED: "0",
+		GROK_HOME: process.env.GROK_CRITIC_HOME || path.join(homedir(), ".grok-critic"),
+	};
 }
 
 function getProviderConfig(provider, mode = "review", options = {}) {
@@ -991,7 +1165,10 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 			// GROK_BIN: env override, else ~/.grok/bin/grok.exe (standard install), else bare `grok`.
 			cmd: GROK_BIN,
 			// Pin optional telemetry off at the harness layer instead of relying on vendor defaults.
-			env: { GROK_TELEMETRY_ENABLED: "0", GROK_TELEMETRY_TRACE_UPLOAD: "0" },
+			// The grok CLI loads Claude Code hooks AND Claude plugins' hooks by default; a host Stop hook
+			// (git-hygiene, semgrep, context-mode) then blocks every reply, so the critic loops to its
+			// turn limit and returns critic_no_output (paid 2026-10-08).
+			env: grokSeatEnv(),
 			args: [],
 			useStdin: false,
 			useTempFile: true,
@@ -1014,8 +1191,10 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 				"run_terminal_command,search_replace,spawn_subagent,use_tool,workflow,search_tool",
 				// NO --effort: grok-4.7 accepts reasoningEffort; we still omit it for safety — revisit
 				// before re-adding because the old grok-composer path 400ed and caused empty verdicts.
+				// 15 turns ran out while grok-4.7 re-read a large prompt file in chunks (critic_no_output,
+				// "Max turns reached", 2026-10-08); 40 leaves room to read the whole diff and answer.
 				"--max-turns",
-				"15",
+				process.env.GROK_CRITIC_MAX_TURNS || "40",
 			],
 			// Reanchoring is a review-mode verdict normalizer. Consult prompts forbid an approval
 			// verdict and expect an unmodified advisory, so in consult mode pass the output through
@@ -1033,23 +1212,67 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 			// CODEX_BIN: env override, else the npm-global codex.cmd resolved by full path
 			// (avoids an unrelated `codex` earlier on PATH shadowing it), else bare `codex`.
 			cmd: CODEX_BIN,
-			args: [
-				"exec",
-				"-m",
+			args: buildCodexExecArgs(
 				options.modelOverride || process.env.CODEX_COUNCIL_MODEL || "gpt-6-sol",
-				"-c",
-				// CODEX_COUNCIL_EFFORT: low|medium|high|xhigh (default high). Large diffs at high can exceed the 600s seat timeout.
-				`model_reasoning_effort=${process.env.CODEX_COUNCIL_EFFORT || "high"}`,
-				"--sandbox",
-				"read-only",
-				"--skip-git-repo-check",
-			],
+			),
 			useStdin: true,
 			useTempFile: false,
 			promptAsTempFile: false,
 			useOutputFile: true,
 			parseOutput: (stdout) => stdout.trim(),
 			minTimeout: 600_000,
+		};
+	}
+
+	if (p === "codexjudge") {
+		// The codex judge is the critic invocation verbatim — same `codex exec`, read-only sandbox,
+		// prompt on stdin — with the approved judge model instead of a critic model.
+		return {
+			cmd: CODEX_BIN,
+			args: buildCodexExecArgs(options.modelOverride || getJudgeSeat().model),
+			useStdin: true,
+			useTempFile: false,
+			promptAsTempFile: false,
+			useOutputFile: true,
+			parseOutput: (stdout) => stdout.trim(),
+			minTimeout: 600_000,
+			...(options.judgeCwd ? { cwd: options.judgeCwd } : {}),
+		};
+	}
+
+	if (p === "grokjudge") {
+		// Commands run only when Bash is requested in a disposable workspace.
+		// Terminal commands can write there; otherwise retain critic read-only permissions.
+		const canExecute = Boolean(options.judgeCwd) && options.judgeTools?.includes("Bash");
+		return {
+			cmd: GROK_BIN,
+			env: grokSeatEnv(),
+			args: [],
+			useStdin: false,
+			useTempFile: true,
+			promptAsTempFile: true,
+			buildArgs: (tempFilePath) => [
+				"--prompt-file",
+				tempFilePath,
+				"-m",
+				options.modelOverride || getJudgeSeat().model,
+				"--permission-mode",
+				canExecute ? "bypassPermissions" : "plan",
+				...(canExecute ? ["--no-plan"] : []),
+				"--output-format",
+				"plain",
+				"--disable-web-search",
+				"--no-subagents",
+				"--disallowed-tools",
+				// Retain the critic denylist unless execution is isolated and requested.
+				[...(canExecute ? [] : ["run_terminal_command"]),
+					"search_replace", "spawn_subagent", "use_tool", "workflow", "search_tool"].join(","),
+				"--max-turns",
+				process.env.GROK_JUDGE_MAX_TURNS || process.env.GROK_CRITIC_MAX_TURNS || "40",
+			],
+			parseOutput: (stdout) => stdout.trim(),
+			minTimeout: (options.judgeTimeoutSeconds ?? JUDGE_TIMEOUT_SECONDS) * 1000,
+			...(options.judgeCwd ? { cwd: options.judgeCwd } : {}),
 		};
 	}
 
@@ -1073,6 +1296,7 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 			minTimeout: 300_000,
 			noShell: process.platform === "win32",
 			twoPass: !isConsult,
+			model: options.modelOverride || OPENCODE_COUNCIL_MODEL,
 		};
 	}
 
@@ -1101,6 +1325,27 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 		};
 	}
 
+	if (p === "pi") {
+		const env = options.env ?? process.env;
+		const message = isConsult
+			? "Read the advisory task in the attached file and follow its instructions exactly. Output only your advisory response."
+			: "The attached file is the complete review task and diff; do not explore anything else or run commands. Analyze it and list every bug, security issue, and code quality problem you find, with file paths and line numbers.";
+		return {
+			cmd: env.PI_BIN || "pi",
+			args: buildPiArgs(env, null, message),
+			buildArgs: (tempFilePath) => buildPiArgs(env, tempFilePath, message),
+			useStdin: false,
+			useTempFile: true,
+			promptAsTempFile: true,
+			parseOutput: isConsult
+				? (stdout) => (stdout || "").trim()
+				: (stdout) => reanchorCriticVerdict(stdout),
+			minTimeout: 0,
+			cwd: process.cwd(),
+			model: env.PI_COUNCIL_MODEL || PI_COUNCIL_MODEL,
+		};
+	}
+
 	if (p === "claude" || p === "claudecode" || p === "opus") {
 		return {
 			cmd: CLAUDE_BIN,
@@ -1109,13 +1354,20 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 				"--model",
 				options.modelOverride || process.env.CLAUDE_CRITIC_MODEL || JUDGE_MODEL,
 				"--effort",
-				"max",
+				// Sonnet 5.5 at max effort still burned 7 turns on tool attempts; at high it answers in one.
+				process.env.CLAUDE_CRITIC_EFFORT || "max",
 				"--output-format",
 				"text",
 				"--settings",
 				CLEAN_SETTINGS_PATH,
+				// A critic gets no tools: the diff in the prompt is its whole input. At max effort a
+				// model still ATTEMPTS tool calls even when none are offered, and each refused attempt
+				// costs a turn — Haiku 5.5 needed 3–4 turns for one tool-less verdict (2026-10-08), so
+				// `--max-turns 1` produced critic_no_output on every run.
+				"--tools",
+				"",
 				"--max-turns",
-				"1",
+				process.env.CLAUDE_CRITIC_MAX_TURNS || "6",
 			],
 			useStdin: true,
 			useTempFile: false,
@@ -1719,14 +1971,99 @@ function normalizeOpenCodeRetryFailure(result) {
 	return result;
 }
 
-async function retryOpenCodeOnce(provider, config, prompt, timeoutMs, firstResult) {
+async function retryOpenCodeOnce(provider, config, prompt, deadline, firstResult) {
 	const reason = firstResult.ok ? "empty output" : firstResult.error || "failure";
 	console.error(
 		`  [${provider}] ${reason}; retrying once after ${OPENCODE_RETRY_DELAY_MS / 1000}s...`,
 	);
+	if (deadline - Date.now() <= OPENCODE_RETRY_DELAY_MS) return normalizeOpenCodeRetryFailure(firstResult);
 	await delay(OPENCODE_RETRY_DELAY_MS);
-	const retryResult = await spawnCriticOnce(provider, config, prompt, timeoutMs);
-	return normalizeOpenCodeRetryFailure(retryResult);
+	const retryResult = await spawnCriticOnce(provider, { ...config, minTimeout: 0 }, prompt, deadline - Date.now());
+	return {
+		...normalizeOpenCodeRetryFailure(retryResult),
+		openCodeAttempted: true,
+		durationMs: firstResult.durationMs + retryResult.durationMs,
+	};
+}
+
+const OPENCODE_RECOVERY_INSTRUCTION =
+	"Your reasoning budget is exhausted. Write the findings and the verdict now, in the required format, without further analysis.";
+
+function probeOpenCodeRunHelp(config, timeoutMs) {
+	try {
+		return execFileSync(
+			config.cmd,
+			[...(process.platform === "win32" ? ["-NoProfile", "-File", OPENCODE_PS1] : []), "run", "--help"],
+			{ encoding: "utf8", timeout: Math.max(1, Math.min(timeoutMs, 5000)) },
+		);
+	} catch {
+		return "";
+	}
+}
+
+function hasRecoveredCriticVerdict(output) {
+	if (collectCriticVerdictLines(output).length !== 1) return false;
+	if (
+		parseJsonFindings(output) === null &&
+		!/(?:^|\n)\s*(?:[-*]\s+\S|No findings\b|Findings:\s*\S)/im.test(output)
+	) return false;
+	return ["allow", "block"].includes(parseCriticVerdict(output).decision);
+}
+
+async function recoverOpenCodeLength(
+	config,
+	prompt,
+	firstResult,
+	deadline,
+	run = spawnCriticOnce,
+	probe = probeOpenCodeRunHelp,
+) {
+	const diagnosis = inspectOpenCodeEvents(firstResult.rawOutput);
+	if (!diagnosis) return firstResult;
+	const metadata = {
+		reason: diagnosis.reason,
+		stepFinishReason: diagnosis.stepFinishReason,
+		tokens: diagnosis.tokens,
+	};
+	const remaining = deadline - Date.now();
+	if (remaining <= 0) return { ...firstResult, ...metadata, ok: false, error: "OpenCode reasoning exhausted; seat timeout reached" };
+	const help = await probe(config, remaining);
+	const canContinue = Boolean(diagnosis.sessionID && /--session\b/.test(help));
+	const variant = /--variant\b/.test(help) ? ["--variant", "minimal"] : [];
+	const recoveryConfig = canContinue
+		? {
+			...config,
+			args: buildOpenCodeArgs(
+				OPENCODE_RECOVERY_INSTRUCTION, null, config.model, ["--session", diagnosis.sessionID],
+			),
+			promptAsTempFile: false,
+			useTempFile: false,
+			minTimeout: 0,
+		}
+		: {
+			...config,
+			buildArgs: (file) =>
+				buildOpenCodeArgs(
+					`Read the attached review task and diff again. ${OPENCODE_RECOVERY_INSTRUCTION}`,
+					file,
+					config.model,
+					variant,
+				),
+			minTimeout: 0,
+		};
+	const budget = deadline - Date.now();
+	if (budget <= 0) return { ...firstResult, ...metadata, ok: false, error: "OpenCode reasoning exhausted; seat timeout reached" };
+	const recovered = await run("opencode", recoveryConfig, canContinue ? OPENCODE_RECOVERY_INSTRUCTION : prompt, budget);
+	const accepted = recovered.ok && hasRecoveredCriticVerdict(recovered.output || "");
+	return {
+		...recovered,
+		...metadata,
+		ok: accepted,
+		error: accepted ? null : recovered.error || "OpenCode reasoning recovery produced no parseable findings and verdict",
+		recovered: accepted ? "reasoning_exhausted" : undefined,
+		durationMs: firstResult.durationMs + recovered.durationMs,
+		rawOutput: `${firstResult.rawOutput || ""}\n${recovered.rawOutput || ""}`.trim(),
+	};
 }
 
 async function spawnCritic(provider, prompt, timeoutMs, mode = "review", options = {}) {
@@ -1741,14 +2078,22 @@ async function spawnCritic(provider, prompt, timeoutMs, mode = "review", options
 		};
 	}
 
-	let result = normalizeProviderFailure(await spawnCriticOnce(provider, config, prompt, timeoutMs));
+	const openCodeDeadline = isOpenCodeProvider(provider) ? Date.now() + timeoutMs : null;
+	let result = normalizeProviderFailure(await spawnCriticOnce(
+		provider,
+		openCodeDeadline ? { ...config, minTimeout: 0 } : config,
+		prompt,
+		timeoutMs,
+	));
+	if (openCodeDeadline && inspectOpenCodeEvents(result.rawOutput)) {
+		result = await recoverOpenCodeLength(config, prompt, result, openCodeDeadline);
+		if (!result.ok) return result;
+	} else if (isOpenCodeProvider(provider) && shouldRetryOpenCodeResult(result)) {
+		result = await retryOpenCodeOnce(provider, config, prompt, openCodeDeadline, result);
+		if (!result.ok) return result;
+	}
 
-	if (isOpenCodeProvider(provider) && shouldRetryOpenCodeResult(result)) {
-		result = await retryOpenCodeOnce(provider, config, prompt, timeoutMs, result);
-		if (!result.ok) {
-			return result;
-		}
-	} else {
+	if (!isOpenCodeProvider(provider)) {
 		if (
 			!result.ok &&
 			config.fallbackArgs &&
@@ -1777,12 +2122,15 @@ async function spawnCritic(provider, prompt, timeoutMs, mode = "review", options
 		}
 	}
 
-	if (config.twoPass && result.ok && hasCriticOutput(result)) {
+	if (config.twoPass && result.ok && hasCriticOutput(result) && !result.recovered) {
 		console.error(
 			`  [${provider}] Pass 1 complete (${(result.durationMs / 1000).toFixed(1)}s), running grading pass (direct API, thinking OFF)...`,
 		);
 		const pass2Prompt = buildPass2Prompt(result.output);
-		const pass2Result = await callLocalModelDirect(pass2Prompt, { timeout: 60_000 });
+		const pass2Budget = openCodeDeadline ? Math.min(60_000, openCodeDeadline - Date.now()) : 60_000;
+		const pass2Result = pass2Budget > 0
+			? await callLocalModelDirect(pass2Prompt, { timeout: pass2Budget })
+			: { ok: false, error: "seat timeout reached" };
 		if (pass2Result.ok && pass2Result.output?.trim()) {
 			result = {
 				provider,
@@ -1801,11 +2149,20 @@ async function spawnCritic(provider, prompt, timeoutMs, mode = "review", options
 
 	// A critic lacking both verdict heading and findings JSON is retried once, then excluded.
 	if (mode === "review" && result.ok && isCriticNoVerdict(result.output || "")) {
+		if (openCodeDeadline && result.openCodeAttempted) return markCriticNoOutput(result);
+		if (openCodeDeadline && openCodeDeadline - Date.now() <= CRITIC_NO_VERDICT_RETRY_DELAY_MS) {
+			return markCriticNoOutput(result);
+		}
 		console.error(
 			`  [${provider}] critic_no_output suspected (<${CRITIC_NO_VERDICT_CHAR_LIMIT} chars, no verdict/findings); retrying once after ${CRITIC_NO_VERDICT_RETRY_DELAY_MS / 1000}s...`,
 		);
 		await delay(CRITIC_NO_VERDICT_RETRY_DELAY_MS);
-		const retryResult = await spawnCriticOnce(provider, config, prompt, timeoutMs);
+		const retryResult = await spawnCriticOnce(
+			provider,
+			openCodeDeadline ? { ...config, minTimeout: 0 } : config,
+			prompt,
+			openCodeDeadline ? openCodeDeadline - Date.now() : timeoutMs,
+		);
 		if (isCriticNoVerdict(retryResult.output || "")) {
 			console.error(`  [${provider}] critic_no_output — excluded from tallies (not a BLOCK)`);
 			return markCriticNoOutput(retryResult);
@@ -3174,8 +3531,15 @@ async function spawnJudgeWithFiles(diff, criticResults, judgeEffort = "high", gr
 			usedWorkspace,
 			judgeOptions.reliabilityContext || "",
 		);
+		const judgeSeat = getJudgeSeat();
+		const judgeProvider =
+			judgeSeat.provider === "codex"
+				? "codexjudge"
+				: judgeSeat.provider === "grok"
+					? "grokjudge"
+					: "opusjudge";
 		const result = await spawnCritic(
-			"opusjudge",
+			judgeProvider,
 			prompt,
 			judgeTimeoutSeconds * 1000,
 			"review",
@@ -3183,10 +3547,18 @@ async function spawnJudgeWithFiles(diff, criticResults, judgeEffort = "high", gr
 				judgeEffort,
 				judgeTools: effectiveTools,
 				judgeTimeoutSeconds,
+				...(judgeSeat.explicit ? { modelOverride: judgeSeat.model } : {}),
 				...(workspacePath ? { judgeCwd: workspacePath } : {}),
 			},
 		);
-		return { ...result, provider: "judge", judgeTools: effectiveTools, judgeExecuted: usedWorkspace };
+		return {
+			...result,
+			provider: "judge",
+			judgeModel: judgeSeat.model,
+			judgeProvider: judgeSeat.provider,
+			judgeTools: effectiveTools,
+			judgeExecuted: usedWorkspace,
+		};
 	} finally {
 		for (const f of tempFiles) {
 			try {
@@ -3403,6 +3775,7 @@ async function runCouncilReview(diff, branchInfo, critics = PHASE1_CRITICS, judg
 		debate,
 		quarantineWarnings,
 		judgeAuthFailed,
+		judgeRetried,
 	};
 }
 
@@ -3664,6 +4037,18 @@ function parseVerdict(output) {
 function toLogMetadata(logData) {
 	const { criticFullOutputs, judgeFullOutput, ...meta } = logData;
 	return meta;
+}
+
+function toCriticLogMetadata(c) {
+	return {
+		provider: c.provider,
+		ok: c.ok,
+		durationMs: c.durationMs,
+		error: c.error,
+		pass2Fallback: c.pass2Fallback ?? false,
+		...(c.reason ? { reason: c.reason, stepFinishReason: c.stepFinishReason, tokens: c.tokens } : {}),
+		...(c.recovered ? { recovered: c.recovered } : {}),
+	};
 }
 
 function writeLog(logData) {
@@ -4164,8 +4549,29 @@ async function runConsult(opts) {
 async function main() {
 	const opts = parseArgs();
 
+	// A COUNCIL_JUDGE pin the harness does not approve refuses before any seat launches: the judge
+	// seat is never silently downgraded to the configured Claude judge.
+	const judgeSeat = getJudgeSeat();
+	if (judgeSeat.error) {
+		process.stderr.write(`Council review gate: ${judgeSeat.error}\n`);
+		process.stderr.write("Exit: unapproved_judge_seat\n");
+		process.exit(2);
+	}
+
 	if (opts.stats) {
 		process.exit(runStats(opts.statsLimit));
+	}
+
+	// The tier this diff would be reviewed at, with no critic launched and no run lock taken. A
+	// wrapper that picks a seat's model by tier (review-council.sh: GPT-6 Astra on CRITICAL) asks
+	// the harness rather than re-deriving the router's rules.
+	if (opts.routeOnly) {
+		const routeBase = opts.base || detectBaseBranch();
+		const route = getTierRoute(routeBase, opts.tier ?? process.env.COUNCIL_TIER);
+		process.stdout.write(
+			`${JSON.stringify({ base: routeBase, tier: route.tier, reasons: route.reasons })}\n`,
+		);
+		process.exit(0);
 	}
 
 	// One council at a time per repository prevents concurrent runs from competing for
@@ -4190,7 +4596,11 @@ async function main() {
 
 	process.stderr.write(`Council review gate: diffing against ${base}\n`);
 
-	const diff = getFullDiff(base);
+	const diffParts = getDiffParts(base);
+	process.stderr.write(
+		`Council review gate: generated bodies omitted: ${diffParts.excludedFiles.join(", ") || "(none)"}\n`,
+	);
+	const diff = getFullDiff(base, diffParts);
 	if (!diff.trim()) {
 		process.stderr.write("Council review gate: no diff — skipping.\n");
 		process.exit(0);
@@ -4203,7 +4613,7 @@ async function main() {
 		`Council review gate: ${diffLines} diff lines, branch=${branchInfo.branch}\n`,
 	);
 
-	const tierRoute = getTierRoute(base, opts.tier ?? process.env.COUNCIL_TIER);
+	const tierRoute = getTierRoute(base, opts.tier ?? process.env.COUNCIL_TIER, diffParts);
 	const tierDepth = resolveTierReviewDepth(tierRoute.tier);
 	process.stderr.write(`${tierDepth.header}\n`);
 	if (tierRoute.warning) {
@@ -4222,7 +4632,7 @@ async function main() {
 		`  [judge] tools: ${judgeToolsLabel}${executedLabel}\n`,
 	);
 	process.stderr.write(
-		`Council review gate: critics=[${effectiveCritics.join(",")}] judge=${JUDGE_MODEL} effort=${tierDepth.judgeEffort}\n`,
+		`Council review gate: critics=[${effectiveCritics.join(",")}] judge=${judgeSeat.model} effort=${tierDepth.judgeEffort}\n`,
 	);
 
 	// Phase 1: Parallel critic sweep
@@ -4267,7 +4677,9 @@ async function main() {
 		configuredCritics: PHASE1_CRITICS,
 		effectiveCritics,
 		opencodePreflight,
-		judge: JUDGE_MODEL,
+		judge: result.phase2.judgeModel || judgeSeat.model,
+		judgeProvider: judgeSeat.provider,
+		judgeRetried: result.judgeRetried === true,
 		judgeEffort: tierDepth.judgeEffort,
 		judgeTools: result.phase2.judgeTools || tierDepth.judgeTools,
 		judgeExecuted: result.phase2.judgeExecuted || tierDepth.judgeExecuted || false,
@@ -4276,13 +4688,9 @@ async function main() {
 		debate: result.debate.enabled,
 		debateTallies: result.debate.tallies,
 		diffLines,
-		phase1: result.phase1.map((c) => ({
-			provider: c.provider,
-			ok: c.ok,
-			durationMs: c.durationMs,
-			error: c.error,
-			pass2Fallback: c.pass2Fallback ?? false,
-		})),
+		excludedDiffPaths: COUNCIL_CONFIG.excludeDiffPaths,
+		diffBodyBytes: diffParts.diffBodyBytes,
+		phase1: result.phase1.map(toCriticLogMetadata),
 		phase2: {
 			provider: "judge",
 			ok: result.phase2.ok,
@@ -4417,6 +4825,7 @@ export {
 	buildReliabilityPromptSection,
 	buildLocalModelHeaders,
 	buildOmpArgs,
+	buildPiArgs,
 	buildOpusContext,
 	buildTaskPrompt,
 	claudeNeedsShell,
@@ -4428,9 +4837,12 @@ export {
 	extractStructuredFindings,
 	FULL_COUNCIL_CRITICS,
 	getBranchInfo,
+	getDiffParts,
 	getFullDiff,
 	getMainWorktreeRoot,
 	getOpenCodePreflightConfig,
+	hasRecoveredCriticVerdict,
+	inspectOpenCodeEvents,
 	getProviderConfig,
 	getSpecializationBlock,
 	getTierRoute,
@@ -4462,6 +4874,7 @@ export {
 	parseVerdict,
 	preflightLocalModel,
 	probeCriticAuth,
+	recoverOpenCodeLength,
 	reanchorCriticVerdict,
 	removeDisposableWorkspace,
 	resolveBuiltInBinary,
@@ -4481,6 +4894,8 @@ export {
 	tallyDebateFindings,
 	TIMEOUT_SECONDS,
 	toLogMetadata,
+	toCriticLogMetadata,
+	writeLog,
 	writeConsultLog,
 	writeCouncilMemory,
 	writeTempFile,

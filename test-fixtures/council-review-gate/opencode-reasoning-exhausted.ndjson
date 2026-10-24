@@ -1,0 +1,4 @@
+{"type":"step_start","sessionID":"ses_fixture","part":{"type":"step-start"}}
+{"type":"step_finish","sessionID":"ses_fixture","part":{"type":"step-finish","reason":"tool-calls","tokens":{"reasoning":7,"output":94}}}
+{"type":"step_start","sessionID":"ses_fixture","part":{"type":"step-start"}}
+{"type":"step_finish","sessionID":"ses_fixture","part":{"type":"step-finish","reason":"length","tokens":{"reasoning":32000,"output":0}}}

@@ -1,11 +1,21 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
 	aggregateFindings,
 	aggregateDebateVotes,
 	buildOmpArgs,
+	buildPiArgs,
 	buildConsultCriticPrompt,
 	buildDebateJudgeSection,
 	buildJudgeInstructions,
@@ -13,6 +23,8 @@ import {
 	buildRebuttalPrompt,
 	claudeNeedsShell,
 	getProviderConfig,
+	hasRecoveredCriticVerdict,
+	inspectOpenCodeEvents,
 	getSpecializationBlock,
 	isJudgeAuthFailure,
 	isJudgeTransientFailure,
@@ -25,13 +37,17 @@ import {
 	parseRebuttalVotes,
 	parseVerdict,
 	preflightLocalModel,
+	recoverOpenCodeLength,
 	reanchorCriticVerdict,
 	resolveLocalModelConfig,
+	resolveJudgeSeat,
 	resolveJudgeTools,
 	shouldRunDebate,
 	synthesizeFromCritics,
 	tallyDebateFindings,
 	toLogMetadata,
+	toCriticLogMetadata,
+	writeLog,
 	writeConsultLog,
 } from "./council-review-gate.mjs";
 
@@ -49,6 +65,143 @@ const SYNTHETIC_ALLOW_REPORT = readFileSync(
 	),
 	"utf8",
 );
+
+const OPENCODE_LENGTH_EVENTS = readFileSync(
+	new URL("./test-fixtures/council-review-gate/opencode-reasoning-exhausted.ndjson", import.meta.url),
+	"utf8",
+);
+
+describe("OpenCode reasoning exhaustion recovery", () => {
+	const first = {
+		provider: "opencode", ok: true, output: "", error: null,
+		durationMs: 100, rawOutput: OPENCODE_LENGTH_EVENTS,
+	};
+	const config = getProviderConfig("opencode", "review");
+	const valid = "ALLOW: no security issue found\nNo findings.";
+	const help = "--session session id\n--variant model variant";
+
+	it("classifies the last length finish and keeps its token counts", () => {
+		expect(inspectOpenCodeEvents(OPENCODE_LENGTH_EVENTS)).toMatchObject({
+			reason: "reasoning_exhausted", stepFinishReason: "length",
+			tokens: { reasoning: 32000, output: 0 }, sessionID: "ses_fixture",
+		});
+		expect(inspectOpenCodeEvents(`${OPENCODE_LENGTH_EVENTS}{"type":"text","part":{"text":"answer"}}`)).toBeNull();
+		expect(inspectOpenCodeEvents(`{"type":"text","part":{"text":"earlier step"}}\n${OPENCODE_LENGTH_EVENTS}`)?.reason).toBe("reasoning_exhausted");
+		expect(inspectOpenCodeEvents('{"type":"step_finish","part":{"reason":"stop"}}')).toBeNull();
+	});
+
+	it("continues the same session once, accepts a parsed verdict, and writes recovery metadata", async () => {
+		let calls = 0;
+		const recovered = await recoverOpenCodeLength(
+			config, "original diff", first, Date.now() + 10_000,
+			async (_provider, recoveryConfig, prompt, budget) => {
+				calls++;
+				expect(recoveryConfig.args).toContain("--session");
+				expect(recoveryConfig.args).toContain("ses_fixture");
+				expect(recoveryConfig.args).not.toContain("--variant");
+				expect(recoveryConfig.promptAsTempFile).toBe(false);
+				expect(prompt).toContain("Write the findings and the verdict now");
+				expect(budget).toBeGreaterThan(0);
+				return { provider: "opencode", ok: true, output: valid, durationMs: 50, rawOutput: "recovered" };
+			},
+			async () => help,
+		);
+		expect(calls).toBe(1);
+		expect(recovered).toMatchObject({
+			ok: true, output: valid, recovered: "reasoning_exhausted", reason: "reasoning_exhausted",
+			tokens: { reasoning: 32000, output: 0 }, durationMs: 150,
+		});
+		expect(hasRecoveredCriticVerdict(valid)).toBe(true);
+		const runDir = writeLog({ phase1: [toCriticLogMetadata(recovered)], criticFullOutputs: [recovered] });
+		try {
+			const meta = JSON.parse(readFileSync(path.join(runDir, "meta.json"), "utf8"));
+			expect(meta.phase1[0]).toMatchObject({
+				recovered: "reasoning_exhausted", reason: "reasoning_exhausted",
+				stepFinishReason: "length", tokens: { reasoning: 32000, output: 0 },
+			});
+		} finally {
+			rmSync(runDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps an empty or unparseable recovery as ERROR", async () => {
+		for (const output of ["", "ALLOW: no issues"]) {
+			const result = await recoverOpenCodeLength(
+				config, "original diff", first, Date.now() + 10_000,
+				async () => ({ provider: "opencode", ok: true, output, durationMs: 20 }),
+				async () => help,
+			);
+			expect(result.ok).toBe(false);
+			expect(result.reason).toBe("reasoning_exhausted");
+			expect(result.recovered).toBeUndefined();
+		}
+		expect(hasRecoveredCriticVerdict("ALLOW: no issues\nNo findings.")).toBe(true);
+	});
+
+	it("uses one fresh run with the diff when session continuation is unavailable", async () => {
+		const result = await recoverOpenCodeLength(
+			config, "original diff", first, Date.now() + 10_000,
+			async (_provider, recoveryConfig, prompt) => {
+				expect(recoveryConfig.promptAsTempFile).toBe(true);
+				expect(recoveryConfig.buildArgs("/tmp/diff.md")).toContain("--variant");
+				expect(prompt).toBe("original diff");
+				return { provider: "opencode", ok: true, output: valid, durationMs: 20 };
+			},
+			async () => "--variant model variant",
+		);
+		expect(result.recovered).toBe("reasoning_exhausted");
+	});
+
+	it("does not recover a normal completion", async () => {
+		const normal = { ...first, output: valid, rawOutput: '{"type":"text","part":{"text":"ALLOW: clean"}}\n{"type":"step_finish","part":{"reason":"stop"}}' };
+		const result = await recoverOpenCodeLength(config, "diff", normal, Date.now() + 10_000,
+			async () => { throw new Error("recovery must not run"); },
+			async () => { throw new Error("help must not run"); });
+		expect(result).toBe(normal);
+	});
+});
+
+describe("pi adapter (second-family DeepSeek seat)", () => {
+	it("runs Pi hermetic and read-only on the pinned DeepSeek model with the prompt as an @file", () => {
+		const config = getProviderConfig("pi", "review", { env: {} });
+		const promptFile = "/tmp/council-prompt.md";
+		const args = config.buildArgs(promptFile);
+
+		expect(config.cmd).toBe("pi");
+		expect(args.slice(0, 11)).toEqual([
+			"-p",
+			"--mode",
+			"text",
+			"--no-session",
+			"--no-tools",
+			"--no-extensions",
+			"--no-skills",
+			"--no-prompt-templates",
+			"--no-themes",
+			"--no-context-files",
+			"--model",
+		]);
+		expect(args[11]).toBe("opencode-go/deepseek-v4.1-flash");
+		expect(args).toContain(`@${promptFile}`);
+		expect(config.useStdin).toBe(false);
+		expect(config.promptAsTempFile).toBe(true);
+	});
+
+	it("never enables a tool or a sign-in path, whatever the environment says", () => {
+		const args = buildPiArgs({ PI_COUNCIL_MODEL: "opencode-go/other", PI_BIN: "/x/pi" }, "/tmp/p.md");
+		expect(args).toContain("--no-tools");
+		for (const forbidden of ["--tools", "-t", "--api-key", "--approve", "-a", "--login"]) {
+			expect(args).not.toContain(forbidden);
+		}
+		expect(args).toContain("opencode-go/other");
+	});
+
+	it("honours PI_BIN and reanchors the verdict so a late BLOCK is read, not a leading ALLOW", () => {
+		const config = getProviderConfig("pi", "review", { env: { PI_BIN: "/opt/pi-custom" } });
+		expect(config.cmd).toBe("/opt/pi-custom");
+		expect(config.parseOutput("ALLOW: first look\nA real hole.\nBLOCK: final").startsWith("BLOCK:")).toBe(true);
+	});
+});
 
 describe("omp adapter", () => {
 	it("uses an @file prompt, the review repository cwd, and the configured executable and model", () => {
@@ -860,7 +1013,7 @@ describe("writeConsultLog", () => {
 // Contaminated providers that have code-review framing in their buildArgs wrapper text.
 // In consult mode, none of their wrapper strings may contain review-specific terms.
 const REVIEW_TERMS = ["code review", "diff", "ALLOW", "BLOCK", "verdict", "shipping blocker"];
-const CONTAMINATED_PROVIDERS = ["omp", "grok", "opencode"];
+const CONTAMINATED_PROVIDERS = ["omp", "grok", "opencode", "pi"];
 
 describe("getProviderConfig consult mode — no code-review framing in wrapper text", () => {
 	for (const provider of CONTAMINATED_PROVIDERS) {
@@ -913,7 +1066,7 @@ describe("getProviderConfig consult mode — twoPass disabled", () => {
 describe("consult mode does not reanchor advisory verdicts", () => {
 	const advisory = "Option A is safer.\nALLOW: prefer A here\nOption B trades speed for risk.";
 
-	for (const provider of ["omp", "grok"]) {
+	for (const provider of ["omp", "grok", "pi"]) {
 		it(`${provider}: consult parseOutput passes the advisory through untouched`, () => {
 			const config = getProviderConfig(provider, "consult");
 			expect(config.parseOutput(advisory)).toBe(advisory);
@@ -1358,5 +1511,277 @@ describe("resolveJudgeTools", () => {
 
 	it("returns Read,Grep,Glob for CRITICAL with judgeCanExecute=false", () => {
 		expect(resolveJudgeTools("CRITICAL", false)).toEqual(["Read", "Grep", "Glob"]);
+	});
+});
+
+describe("--route-only (tier for a wrapper that picks a seat model by tier)", () => {
+	const gate = fileURLToPath(new URL("./council-review-gate.mjs", import.meta.url));
+	const run = (cwd, args, cmd = "node") =>
+		execFileSync(cmd, args, {
+			cwd,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+			env: {
+				...process.env,
+				GIT_AUTHOR_NAME: "t",
+				GIT_AUTHOR_EMAIL: "t@example.invalid",
+				GIT_COMMITTER_NAME: "t",
+				GIT_COMMITTER_EMAIL: "t@example.invalid",
+			},
+		});
+	const git = (cwd, ...args) =>
+		run(cwd, ["-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main", ...args], "git");
+
+	it("prints the routed tier as JSON, runs no critic and leaves no run state behind", () => {
+		const dir = mkdtempSync(path.join(tmpdir(), "route-only-"));
+		try {
+			git(dir, "init", "-q");
+			writeFileSync(path.join(dir, "a.ts"), "export const a = 1;\n");
+			git(dir, "add", "-A");
+			git(dir, "commit", "-q", "-m", "base");
+			git(dir, "checkout", "-q", "-b", "work");
+			writeFileSync(path.join(dir, "a.ts"), "export const a = 2;\n");
+			git(dir, "commit", "-q", "-am", "ts change");
+			const standard = JSON.parse(run(dir, [gate, "--route-only", "--base", "main"]));
+			expect(standard.tier).toBe("STANDARD");
+			expect(standard.base).toBe("main");
+
+			mkdirSync(path.join(dir, "db"), { recursive: true });
+			writeFileSync(path.join(dir, "db", "x.sql"), "select 1;\n");
+			git(dir, "add", "-A");
+			git(dir, "commit", "-q", "-m", "sql change");
+			expect(JSON.parse(run(dir, [gate, "--route-only", "--base", "main"])).tier).toBe("CRITICAL");
+			expect(existsSync(path.join(dir, ".reviewteam"))).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("parseArgs sets routeOnly only when asked", () => {
+		expect(parseArgs(["--route-only"]).routeOnly).toBe(true);
+		expect(parseArgs([]).routeOnly).toBe(false);
+	});
+});
+
+describe("COUNCIL_JUDGE — approved judge seats (2026-10-24 conservation roster)", () => {
+	const gate = fileURLToPath(
+		new URL("./council-review-gate.mjs", import.meta.url),
+	);
+
+	it("keeps the configured Claude judge when the pin is unset or blank", () => {
+		for (const value of [undefined, "", "   "]) {
+			expect(resolveJudgeSeat(value)).toEqual({
+				provider: "claude",
+				model: "claude-opus-5-5",
+				explicit: false,
+			});
+		}
+		// The Claude judge invocation itself is untouched: same model and stdin prompt flow.
+		const judge = getProviderConfig("opusjudge");
+		expect(judge.args).toContain("claude-opus-5-5");
+		expect(judge.useStdin).toBe(true);
+		expect(judge.useOutputFile).toBeUndefined();
+	});
+
+	it("resolves exactly the two approved pins", () => {
+		expect(resolveJudgeSeat("codex:gpt-6.1-sol")).toEqual({
+			provider: "codex",
+			model: "gpt-6.1-sol",
+			explicit: true,
+		});
+		expect(resolveJudgeSeat("grok:grok-4.7")).toEqual({
+			provider: "grok",
+			model: "grok-4.7",
+			explicit: true,
+		});
+	});
+
+	it("refuses every unapproved provider or model instead of falling back", () => {
+		for (const value of [
+			"codex:gpt-6-astra",
+			"codex:gpt-6-sol",
+			"claude:claude-opus-5-5",
+			"grok:grok-4.6",
+			"openai:gpt-6.1-sol",
+			"codex",
+			"codex:",
+			":gpt-6.1-sol",
+		]) {
+			expect(resolveJudgeSeat(value).error, value).toMatch(
+				/is not an approved judge seat/,
+			);
+			expect(resolveJudgeSeat(value).provider, value).toBeUndefined();
+		}
+	});
+
+	it("fails closed at the CLI before any seat launches", () => {
+		const run = spawnSync(process.execPath, [gate, "--route-only"], {
+			cwd: tmpdir(),
+			encoding: "utf8",
+			env: { ...process.env, COUNCIL_JUDGE: "codex:gpt-6-astra" },
+		});
+		expect(run.status).toBe(2);
+		expect(run.stderr).toContain("is not an approved judge seat");
+		expect(run.stderr).toContain("unapproved_judge_seat");
+		expect(run.stdout).toBe("");
+	});
+
+	it("lets an approved pin route as the wrapper needs", () => {
+		const dir = mkdtempSync(path.join(tmpdir(), "judge-seat-route-"));
+		try {
+			const g = (...args) =>
+				execFileSync(
+					"git",
+					[
+						"-c",
+						"commit.gpgsign=false",
+						"-c",
+						"init.defaultBranch=main",
+						...args,
+					],
+					{ cwd: dir, encoding: "utf8" },
+				);
+			g("init", "-q");
+			writeFileSync(path.join(dir, "a.ts"), "export const a = 1;\n");
+			g("add", "-A");
+			g("commit", "-q", "-m", "base");
+			g("checkout", "-q", "-b", "work");
+			writeFileSync(path.join(dir, "a.ts"), "export const a = 2;\n");
+			g("commit", "-q", "-am", "change");
+			const run = spawnSync(
+				process.execPath,
+				[gate, "--route-only", "--base", "main"],
+				{
+					cwd: dir,
+					encoding: "utf8",
+					env: {
+						...process.env,
+						COUNCIL_JUDGE: "codex:gpt-6.1-sol",
+						GIT_AUTHOR_NAME: "t",
+						GIT_AUTHOR_EMAIL: "t@example.invalid",
+						GIT_COMMITTER_NAME: "t",
+						GIT_COMMITTER_EMAIL: "t@example.invalid",
+					},
+				},
+			);
+			expect(run.status, run.stderr).toBe(0);
+			expect(JSON.parse(run.stdout).tier).toBe("STANDARD");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("invokes the codex judge exactly like the codex critic, with the judge model", () => {
+		const judge = getProviderConfig("codexjudge", "review", {
+			modelOverride: "gpt-6.1-sol",
+		});
+		const critic = getProviderConfig("codex", "review", {
+			modelOverride: "gpt-6.1-sol",
+		});
+		expect(judge.cmd).toBe(critic.cmd);
+		expect(judge.args).toEqual(critic.args);
+		expect(judge.args).toEqual(
+			expect.arrayContaining([
+				"exec",
+				"-m",
+				"gpt-6.1-sol",
+				"--sandbox",
+				"read-only",
+			]),
+		);
+		expect(judge.args.join(" ")).toContain("model_reasoning_effort=high");
+		expect(judge.useStdin).toBe(true);
+		expect(judge.useOutputFile).toBe(true);
+		// Verdict parsing is the judge path's, not a critic re-anchor: the raw text reaches parseVerdict.
+		expect(
+			judge.parseOutput('preamble\n## ALLOW: fine\n{"decision":"allow"}\n'),
+		).toBe('preamble\n## ALLOW: fine\n{"decision":"allow"}');
+	});
+
+	it("keeps the grok critic guards on the grok judge without plan mode", () => {
+		const judge = getProviderConfig("grokjudge", "review", {
+			modelOverride: "grok-4.7",
+			judgeCwd: "/disposable/work",
+			judgeTools: ["Read", "Bash"],
+		});
+		const critic = getProviderConfig("grok");
+		const args = judge.buildArgs("/tmp/judge-prompt.md");
+		expect(judge.cmd).toBe(critic.cmd);
+		expect(judge.env.GROK_HOME).toBe(critic.env.GROK_HOME);
+		expect(judge.env.GROK_TELEMETRY_ENABLED).toBe("0");
+		expect(judge.promptAsTempFile).toBe(true);
+		expect(args).toEqual(
+			expect.arrayContaining(["--prompt-file", "/tmp/judge-prompt.md"]),
+		);
+		expect(args).toEqual(expect.arrayContaining(["-m", "grok-4.7"]));
+		expect(args).not.toContain("plan");
+		expect(args[args.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
+		expect(args).toContain("--no-plan");
+		const deny = args[args.indexOf("--disallowed-tools") + 1];
+		for (const tool of [
+			"search_replace",
+			"spawn_subagent",
+			"workflow",
+			"search_tool",
+		])
+			expect(deny.split(",")).toContain(tool);
+		// Repo read and execution stay available; no edits, no subagents, no web.
+		expect(deny.split(",")).not.toContain("run_terminal_command");
+		expect(args).toContain("--no-subagents");
+		expect(args).toContain("--disable-web-search");
+		expect(judge.parseOutput("  ## BLOCK: x\n")).toBe("## BLOCK: x");
+	});
+
+	it("forwards the disposable workspace to both new judge providers", () => {
+		for (const provider of ["codexjudge", "grokjudge"]) {
+			const judge = getProviderConfig(provider, "review", {
+				judgeCwd: "/disposable/work",
+			});
+			expect(judge.cwd, provider).toBe("/disposable/work");
+		}
+	});
+
+	it("denies Grok terminal execution without both Bash and a disposable workspace", () => {
+		for (const options of [
+			{},
+			{ judgeTools: ["Bash"] },
+			{ judgeCwd: "/disposable/work", judgeTools: ["Read", "Grep", "Glob"] },
+		]) {
+			const args = getProviderConfig("grokjudge", "review", options).buildArgs(
+				"prompt.md",
+			);
+			expect(args[args.indexOf("--permission-mode") + 1]).toBe("plan");
+			expect(args[args.indexOf("--disallowed-tools") + 1].split(",")).toContain(
+				"run_terminal_command",
+			);
+		}
+	});
+
+	it("records the judge that actually ran, including a retry, in the run record", () => {
+		const runDir = writeLog({
+			judge: "gpt-6.1-sol",
+			judgeProvider: "codex",
+			judgeRetried: true,
+			phase2: { provider: "judge", ok: true, durationMs: 1, error: null },
+			judgeFullOutput: {
+				provider: "judge",
+				ok: true,
+				output: "## ALLOW: fine",
+				durationMs: 1,
+			},
+		});
+		try {
+			const meta = JSON.parse(
+				readFileSync(path.join(runDir, "meta.json"), "utf8"),
+			);
+			expect(meta).toMatchObject({
+				judge: "gpt-6.1-sol",
+				judgeProvider: "codex",
+				judgeRetried: true,
+			});
+			expect(meta.judgeFullOutput).toBeUndefined();
+		} finally {
+			rmSync(runDir, { recursive: true, force: true });
+		}
 	});
 });

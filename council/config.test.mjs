@@ -8,6 +8,15 @@ describe("normalizeCouncilConfig", () => {
 		expect(config.critics).toEqual(DEFAULT_CONFIG.critics);
 		expect(config.pathTierRules.length).toBeGreaterThan(0);
 		expect(config.timeoutSeconds).toBeGreaterThan(0);
+		expect(config.excludeDiffPaths).toEqual(DEFAULT_CONFIG.excludeDiffPaths);
+	});
+
+	it("extends the generated-path defaults with custom globs", () => {
+		const config = normalizeCouncilConfig({ excludeDiffPaths: ["generated/**", "pnpm-lock.yaml"] });
+		expect(config.excludeDiffPaths).toEqual([...DEFAULT_CONFIG.excludeDiffPaths, "generated/**"]);
+		expect(() => normalizeCouncilConfig({ excludeDiffPaths: [""] })).toThrow(
+			'"excludeDiffPaths" must be an array of non-empty strings',
+		);
 	});
 
 	it("preserves project criteria and CLI critic definitions", () => {
@@ -39,7 +48,7 @@ describe("normalizeCouncilConfig", () => {
 
 	it("rejects the removed qwencode adapter with migration guidance", () => {
 		expect(() => normalizeCouncilConfig({ critics: ["qwencode"] })).toThrow(
-			'unknown critic id(s): "qwencode". Valid built-in adapters: claude, codex, grok, omp, opencode. Define custom CLIs in "criticCommands".',
+			'unknown critic id(s): "qwencode". Valid built-in adapters: claude, codex, grok, omp, opencode, pi. Define custom CLIs in "criticCommands".',
 		);
 	});
 

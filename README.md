@@ -70,6 +70,7 @@ Five adapters ship built in. Each shells out to a CLI you install and authentica
 | `grok` | `grok` | `grok-4.7` | `GROK_BIN`, `GROK_COUNCIL_MODEL` |
 | `opencode` | `opencode` | `opencode-go/deepseek-v4.1-flash` | `OPENCODE_COUNCIL_MODEL` |
 | `omp` | `omp` | omp's configured model | `OMP_BIN`, `OMP_COUNCIL_MODEL` |
+| `pi` | `pi` | `opencode-go/deepseek-v4.1-flash` | `PI_BIN`, `PI_COUNCIL_MODEL` |
 
 CLI version floors for these defaults: `gpt-6-sol` needs a Codex CLI newer than 0.144 (older builds answer
 `400 … model is not supported when using Codex with a ChatGPT account`), and the `claude-opus-5-5` judge needs Claude
@@ -185,10 +186,16 @@ Exit codes are `0` for `ALLOW`, `1` for `BLOCK`, `2` for a harness error, and `3
 | `judgeModel` | string | `"claude-opus-5-5"` | Model argument passed to the Claude CLI for Phase 2. |
 | `judgeCanExecute` | boolean | `true` | When `true`, CRITICAL-tier review grants the judge Bash access in a disposable worktree (see below). When `false`, CRITICAL uses the STANDARD tool set. Teams that don't want a model executing anything can turn this off and keep search-only verification. |
 | `timeoutSeconds` | integer | `300` | Base critic wall-clock timeout. Built-in adapters may enforce a larger minimum. |
+
 | `judgeTimeoutSeconds` | integer | `360` | Judge wall-clock timeout. Doubled to 2× when the judge runs at the Bash tier (CRITICAL + `judgeCanExecute: true`), because verification takes longer than reading. |
-| `maxDiffBytes` | integer | `200000` | Maximum diff bytes placed directly in critic prompts before truncation. |
+| `maxDiffBytes` | integer | `200000` | Maximum reviewable diff body bytes placed directly in critic prompts before truncation. |
+| `excludeDiffPaths` | string[] | generated paths (below) | Additional gitignore-style globs whose diff bodies are omitted. |
 | `logDir` | string | `".reviewteam/review-logs"` | Repository-relative directory for run artifacts and the run lock. |
 | `memoryDir` | string | `".reviewteam/memory"` | Repository-relative directory for learned false-positive memories. |
+
+If OpenCode finishes with a JSON `step_finish` event whose reason is `length` and it has emitted no assistant text, ReviewTeam records `reasoning_exhausted` with the reasoning and output token counts. It makes one bounded recovery attempt: continue the captured OpenCode session with a short request for findings and a verdict, or rerun the attached diff when session continuation is unavailable. The installed CLI's `run --help` determines whether `--session` and the lower `--variant minimal` setting can be used. A recovery needs a parseable findings section and one explicit verdict line; otherwise the seat remains an error. The seat's `meta.json` records the cause and `recovered: "reasoning_exhausted"` when recovery succeeds.
+
+`excludeDiffPaths` extends the built-in list: `**/migrations/meta/*_snapshot.json`, `**/migrations/meta/_journal.json`, `pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`, `Cargo.lock`, `**/*.min.js`, `**/*.min.css`, and `**/catalog-expectation*.json`. These generated bodies are omitted from critic prompts and the diff byte limit, but their names and numstat remain visible under `[GENERATED FILES (bodies omitted)]`; all changed paths still participate in tier routing. The run's `meta.json` records the applied patterns as `excludedDiffPaths` and the remaining body size in bytes as `diffBodyBytes`.
 
 ### `pathTierRules`
 

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
-export const BUILT_IN_CRITICS = ["claude", "codex", "grok", "omp", "opencode"];
+export const BUILT_IN_CRITICS = ["claude", "codex", "grok", "omp", "opencode", "pi"];
 
 export const DEFAULT_CONFIG = {
 	projectName: "Your Project",
@@ -42,6 +42,17 @@ export const DEFAULT_CONFIG = {
 	timeoutSeconds: 300,
 	judgeTimeoutSeconds: 360,
 	maxDiffBytes: 200_000,
+	excludeDiffPaths: [
+		"**/migrations/meta/*_snapshot.json",
+		"**/migrations/meta/_journal.json",
+		"pnpm-lock.yaml",
+		"package-lock.json",
+		"yarn.lock",
+		"Cargo.lock",
+		"**/*.min.js",
+		"**/*.min.css",
+		"**/catalog-expectation*.json",
+	],
 	logDir: ".reviewteam/review-logs",
 	memoryDir: ".reviewteam/memory",
 };
@@ -177,6 +188,12 @@ export function normalizeCouncilConfig(raw = {}) {
 			"maxDiffBytes",
 			DEFAULT_CONFIG.maxDiffBytes,
 		),
+		excludeDiffPaths: [
+			...new Set([
+				...DEFAULT_CONFIG.excludeDiffPaths,
+				...requireStringArray(raw.excludeDiffPaths, "excludeDiffPaths", []),
+			]),
+		],
 		logDir: requireString(raw.logDir, "logDir", DEFAULT_CONFIG.logDir),
 		memoryDir: requireString(raw.memoryDir, "memoryDir", DEFAULT_CONFIG.memoryDir),
 	};
