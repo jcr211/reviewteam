@@ -53,6 +53,40 @@ const PHASE1_CRITICS = process.env.COUNCIL_CRITICS
 	: FULL_COUNCIL_CRITICS;
 const JUDGE_MODEL = COUNCIL_CONFIG.judgeModel;
 const GROK_COUNCIL_MODEL = process.env.GROK_COUNCIL_MODEL || "grok-4.7";
+// James, 2026-10-24 (ReviewTeam conservation roster): the judge seat is selectable by an explicit
+// COUNCIL_JUDGE=<provider>:<model> pin — the Codex judge on a standard review, Grok 4.7 on a
+// critical or integration one. Unset, every judge path keeps its configured Claude behaviour.
+export const APPROVED_JUDGE_SEATS = {
+	codex: ["gpt-6.1-sol"],
+	grok: ["grok-4.7"],
+};
+
+/**
+ * Resolve the COUNCIL_JUDGE pin. Unset/empty means the configured Claude judge (`judgeModel`), so
+ * an existing run is unchanged; any unapproved provider or model is an error the gate refuses.
+ */
+export function resolveJudgeSeat(raw = process.env.COUNCIL_JUDGE) {
+	const configured = { provider: "claude", model: JUDGE_MODEL, explicit: false };
+	if (raw === undefined || raw === null || String(raw).trim() === "") return configured;
+	const value = String(raw).trim();
+	const match = /^([a-z]+):(\S+)$/.exec(value);
+	const approved = match ? APPROVED_JUDGE_SEATS[match[1]] : undefined;
+	if (!approved?.includes(match[2])) {
+		return {
+			error: `COUNCIL_JUDGE=${value} is not an approved judge seat (approved: ${Object.entries(
+				APPROVED_JUDGE_SEATS,
+			)
+				.map(([provider, models]) => models.map((model) => `${provider}:${model}`).join(", "))
+				.join(", ")})`,
+		};
+	}
+	return { provider: match[1], model: match[2], explicit: true };
+}
+
+/** The judge seat this process runs under. Absent COUNCIL_JUDGE = the configured Claude judge. */
+export function getJudgeSeat() {
+	return resolveJudgeSeat(process.env.COUNCIL_JUDGE);
+}
 
 function stripTrailingV1(url) {
 	return url
@@ -1060,6 +1094,35 @@ function buildPiArgs(env = process.env, promptFilePath = null, message = null) {
 	];
 }
 
+/** The codex CLI invocation shared by the codex critic and the codex judge seat. */
+function buildCodexExecArgs(model) {
+	return [
+		"exec",
+		"-m",
+		model,
+		"-c",
+		// CODEX_COUNCIL_EFFORT: low|medium|high|xhigh (default high). Large diffs at high can exceed the 600s seat timeout.
+		`model_reasoning_effort=${process.env.CODEX_COUNCIL_EFFORT || "high"}`,
+		"--sandbox",
+		"read-only",
+		"--skip-git-repo-check",
+	];
+}
+
+/**
+ * The isolated environment every grok seat runs in: telemetry off and a dedicated profile
+ * (GROK_CRITIC_HOME, default ~/.grok-critic: auth symlinked to ~/.grok, compat off, requirements.toml
+ * `allow_managed_hooks_only = true`) so no host hook can run and block the reply.
+ */
+function grokSeatEnv() {
+	return {
+		GROK_TELEMETRY_ENABLED: "0",
+		GROK_TELEMETRY_TRACE_UPLOAD: "0",
+		GROK_CLAUDE_HOOKS_ENABLED: "0",
+		GROK_HOME: process.env.GROK_CRITIC_HOME || path.join(homedir(), ".grok-critic"),
+	};
+}
+
 function getProviderConfig(provider, mode = "review", options = {}) {
 	const isConsult = mode === "consult";
 	const p = provider.toLowerCase().replace(/-/g, "");
@@ -1104,15 +1167,8 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 			// Pin optional telemetry off at the harness layer instead of relying on vendor defaults.
 			// The grok CLI loads Claude Code hooks AND Claude plugins' hooks by default; a host Stop hook
 			// (git-hygiene, semgrep, context-mode) then blocks every reply, so the critic loops to its
-			// turn limit and returns critic_no_output (paid 2026-10-08). Critic runs use a dedicated
-			// profile (GROK_CRITIC_HOME, default ~/.grok-critic: auth symlinked to ~/.grok, compat off,
-			// requirements.toml `allow_managed_hooks_only = true`) so no hook of any kind can run.
-			env: {
-				GROK_TELEMETRY_ENABLED: "0",
-				GROK_TELEMETRY_TRACE_UPLOAD: "0",
-				GROK_CLAUDE_HOOKS_ENABLED: "0",
-				GROK_HOME: process.env.GROK_CRITIC_HOME || path.join(homedir(), ".grok-critic"),
-			},
+			// turn limit and returns critic_no_output (paid 2026-10-08).
+			env: grokSeatEnv(),
 			args: [],
 			useStdin: false,
 			useTempFile: true,
@@ -1156,23 +1212,67 @@ function getProviderConfig(provider, mode = "review", options = {}) {
 			// CODEX_BIN: env override, else the npm-global codex.cmd resolved by full path
 			// (avoids an unrelated `codex` earlier on PATH shadowing it), else bare `codex`.
 			cmd: CODEX_BIN,
-			args: [
-				"exec",
-				"-m",
+			args: buildCodexExecArgs(
 				options.modelOverride || process.env.CODEX_COUNCIL_MODEL || "gpt-6-sol",
-				"-c",
-				// CODEX_COUNCIL_EFFORT: low|medium|high|xhigh (default high). Large diffs at high can exceed the 600s seat timeout.
-				`model_reasoning_effort=${process.env.CODEX_COUNCIL_EFFORT || "high"}`,
-				"--sandbox",
-				"read-only",
-				"--skip-git-repo-check",
-			],
+			),
 			useStdin: true,
 			useTempFile: false,
 			promptAsTempFile: false,
 			useOutputFile: true,
 			parseOutput: (stdout) => stdout.trim(),
 			minTimeout: 600_000,
+		};
+	}
+
+	if (p === "codexjudge") {
+		// The codex judge is the critic invocation verbatim — same `codex exec`, read-only sandbox,
+		// prompt on stdin — with the approved judge model instead of a critic model.
+		return {
+			cmd: CODEX_BIN,
+			args: buildCodexExecArgs(options.modelOverride || getJudgeSeat().model),
+			useStdin: true,
+			useTempFile: false,
+			promptAsTempFile: false,
+			useOutputFile: true,
+			parseOutput: (stdout) => stdout.trim(),
+			minTimeout: 600_000,
+			...(options.judgeCwd ? { cwd: options.judgeCwd } : {}),
+		};
+	}
+
+	if (p === "grokjudge") {
+		// Commands run only when Bash is requested in a disposable workspace.
+		// Terminal commands can write there; otherwise retain critic read-only permissions.
+		const canExecute = Boolean(options.judgeCwd) && options.judgeTools?.includes("Bash");
+		return {
+			cmd: GROK_BIN,
+			env: grokSeatEnv(),
+			args: [],
+			useStdin: false,
+			useTempFile: true,
+			promptAsTempFile: true,
+			buildArgs: (tempFilePath) => [
+				"--prompt-file",
+				tempFilePath,
+				"-m",
+				options.modelOverride || getJudgeSeat().model,
+				"--permission-mode",
+				canExecute ? "bypassPermissions" : "plan",
+				...(canExecute ? ["--no-plan"] : []),
+				"--output-format",
+				"plain",
+				"--disable-web-search",
+				"--no-subagents",
+				"--disallowed-tools",
+				// Retain the critic denylist unless execution is isolated and requested.
+				[...(canExecute ? [] : ["run_terminal_command"]),
+					"search_replace", "spawn_subagent", "use_tool", "workflow", "search_tool"].join(","),
+				"--max-turns",
+				process.env.GROK_JUDGE_MAX_TURNS || process.env.GROK_CRITIC_MAX_TURNS || "40",
+			],
+			parseOutput: (stdout) => stdout.trim(),
+			minTimeout: (options.judgeTimeoutSeconds ?? JUDGE_TIMEOUT_SECONDS) * 1000,
+			...(options.judgeCwd ? { cwd: options.judgeCwd } : {}),
 		};
 	}
 
@@ -3431,8 +3531,15 @@ async function spawnJudgeWithFiles(diff, criticResults, judgeEffort = "high", gr
 			usedWorkspace,
 			judgeOptions.reliabilityContext || "",
 		);
+		const judgeSeat = getJudgeSeat();
+		const judgeProvider =
+			judgeSeat.provider === "codex"
+				? "codexjudge"
+				: judgeSeat.provider === "grok"
+					? "grokjudge"
+					: "opusjudge";
 		const result = await spawnCritic(
-			"opusjudge",
+			judgeProvider,
 			prompt,
 			judgeTimeoutSeconds * 1000,
 			"review",
@@ -3440,10 +3547,18 @@ async function spawnJudgeWithFiles(diff, criticResults, judgeEffort = "high", gr
 				judgeEffort,
 				judgeTools: effectiveTools,
 				judgeTimeoutSeconds,
+				...(judgeSeat.explicit ? { modelOverride: judgeSeat.model } : {}),
 				...(workspacePath ? { judgeCwd: workspacePath } : {}),
 			},
 		);
-		return { ...result, provider: "judge", judgeTools: effectiveTools, judgeExecuted: usedWorkspace };
+		return {
+			...result,
+			provider: "judge",
+			judgeModel: judgeSeat.model,
+			judgeProvider: judgeSeat.provider,
+			judgeTools: effectiveTools,
+			judgeExecuted: usedWorkspace,
+		};
 	} finally {
 		for (const f of tempFiles) {
 			try {
@@ -3660,6 +3775,7 @@ async function runCouncilReview(diff, branchInfo, critics = PHASE1_CRITICS, judg
 		debate,
 		quarantineWarnings,
 		judgeAuthFailed,
+		judgeRetried,
 	};
 }
 
@@ -4433,6 +4549,15 @@ async function runConsult(opts) {
 async function main() {
 	const opts = parseArgs();
 
+	// A COUNCIL_JUDGE pin the harness does not approve refuses before any seat launches: the judge
+	// seat is never silently downgraded to the configured Claude judge.
+	const judgeSeat = getJudgeSeat();
+	if (judgeSeat.error) {
+		process.stderr.write(`Council review gate: ${judgeSeat.error}\n`);
+		process.stderr.write("Exit: unapproved_judge_seat\n");
+		process.exit(2);
+	}
+
 	if (opts.stats) {
 		process.exit(runStats(opts.statsLimit));
 	}
@@ -4507,7 +4632,7 @@ async function main() {
 		`  [judge] tools: ${judgeToolsLabel}${executedLabel}\n`,
 	);
 	process.stderr.write(
-		`Council review gate: critics=[${effectiveCritics.join(",")}] judge=${JUDGE_MODEL} effort=${tierDepth.judgeEffort}\n`,
+		`Council review gate: critics=[${effectiveCritics.join(",")}] judge=${judgeSeat.model} effort=${tierDepth.judgeEffort}\n`,
 	);
 
 	// Phase 1: Parallel critic sweep
@@ -4552,7 +4677,9 @@ async function main() {
 		configuredCritics: PHASE1_CRITICS,
 		effectiveCritics,
 		opencodePreflight,
-		judge: JUDGE_MODEL,
+		judge: result.phase2.judgeModel || judgeSeat.model,
+		judgeProvider: judgeSeat.provider,
+		judgeRetried: result.judgeRetried === true,
 		judgeEffort: tierDepth.judgeEffort,
 		judgeTools: result.phase2.judgeTools || tierDepth.judgeTools,
 		judgeExecuted: result.phase2.judgeExecuted || tierDepth.judgeExecuted || false,

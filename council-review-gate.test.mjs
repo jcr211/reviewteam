@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
@@ -40,6 +40,7 @@ import {
 	recoverOpenCodeLength,
 	reanchorCriticVerdict,
 	resolveLocalModelConfig,
+	resolveJudgeSeat,
 	resolveJudgeTools,
 	shouldRunDebate,
 	synthesizeFromCritics,
@@ -1559,5 +1560,228 @@ describe("--route-only (tier for a wrapper that picks a seat model by tier)", ()
 	it("parseArgs sets routeOnly only when asked", () => {
 		expect(parseArgs(["--route-only"]).routeOnly).toBe(true);
 		expect(parseArgs([]).routeOnly).toBe(false);
+	});
+});
+
+describe("COUNCIL_JUDGE — approved judge seats (2026-10-24 conservation roster)", () => {
+	const gate = fileURLToPath(
+		new URL("./council-review-gate.mjs", import.meta.url),
+	);
+
+	it("keeps the configured Claude judge when the pin is unset or blank", () => {
+		for (const value of [undefined, "", "   "]) {
+			expect(resolveJudgeSeat(value)).toEqual({
+				provider: "claude",
+				model: "claude-opus-5-5",
+				explicit: false,
+			});
+		}
+		// The Claude judge invocation itself is untouched: same model and stdin prompt flow.
+		const judge = getProviderConfig("opusjudge");
+		expect(judge.args).toContain("claude-opus-5-5");
+		expect(judge.useStdin).toBe(true);
+		expect(judge.useOutputFile).toBeUndefined();
+	});
+
+	it("resolves exactly the two approved pins", () => {
+		expect(resolveJudgeSeat("codex:gpt-6.1-sol")).toEqual({
+			provider: "codex",
+			model: "gpt-6.1-sol",
+			explicit: true,
+		});
+		expect(resolveJudgeSeat("grok:grok-4.7")).toEqual({
+			provider: "grok",
+			model: "grok-4.7",
+			explicit: true,
+		});
+	});
+
+	it("refuses every unapproved provider or model instead of falling back", () => {
+		for (const value of [
+			"codex:gpt-6-astra",
+			"codex:gpt-6-sol",
+			"claude:claude-opus-5-5",
+			"grok:grok-4.6",
+			"openai:gpt-6.1-sol",
+			"codex",
+			"codex:",
+			":gpt-6.1-sol",
+		]) {
+			expect(resolveJudgeSeat(value).error, value).toMatch(
+				/is not an approved judge seat/,
+			);
+			expect(resolveJudgeSeat(value).provider, value).toBeUndefined();
+		}
+	});
+
+	it("fails closed at the CLI before any seat launches", () => {
+		const run = spawnSync(process.execPath, [gate, "--route-only"], {
+			cwd: tmpdir(),
+			encoding: "utf8",
+			env: { ...process.env, COUNCIL_JUDGE: "codex:gpt-6-astra" },
+		});
+		expect(run.status).toBe(2);
+		expect(run.stderr).toContain("is not an approved judge seat");
+		expect(run.stderr).toContain("unapproved_judge_seat");
+		expect(run.stdout).toBe("");
+	});
+
+	it("lets an approved pin route as the wrapper needs", () => {
+		const dir = mkdtempSync(path.join(tmpdir(), "judge-seat-route-"));
+		try {
+			const g = (...args) =>
+				execFileSync(
+					"git",
+					[
+						"-c",
+						"commit.gpgsign=false",
+						"-c",
+						"init.defaultBranch=main",
+						...args,
+					],
+					{ cwd: dir, encoding: "utf8" },
+				);
+			g("init", "-q");
+			writeFileSync(path.join(dir, "a.ts"), "export const a = 1;\n");
+			g("add", "-A");
+			g("commit", "-q", "-m", "base");
+			g("checkout", "-q", "-b", "work");
+			writeFileSync(path.join(dir, "a.ts"), "export const a = 2;\n");
+			g("commit", "-q", "-am", "change");
+			const run = spawnSync(
+				process.execPath,
+				[gate, "--route-only", "--base", "main"],
+				{
+					cwd: dir,
+					encoding: "utf8",
+					env: {
+						...process.env,
+						COUNCIL_JUDGE: "codex:gpt-6.1-sol",
+						GIT_AUTHOR_NAME: "t",
+						GIT_AUTHOR_EMAIL: "t@example.invalid",
+						GIT_COMMITTER_NAME: "t",
+						GIT_COMMITTER_EMAIL: "t@example.invalid",
+					},
+				},
+			);
+			expect(run.status, run.stderr).toBe(0);
+			expect(JSON.parse(run.stdout).tier).toBe("STANDARD");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("invokes the codex judge exactly like the codex critic, with the judge model", () => {
+		const judge = getProviderConfig("codexjudge", "review", {
+			modelOverride: "gpt-6.1-sol",
+		});
+		const critic = getProviderConfig("codex", "review", {
+			modelOverride: "gpt-6.1-sol",
+		});
+		expect(judge.cmd).toBe(critic.cmd);
+		expect(judge.args).toEqual(critic.args);
+		expect(judge.args).toEqual(
+			expect.arrayContaining([
+				"exec",
+				"-m",
+				"gpt-6.1-sol",
+				"--sandbox",
+				"read-only",
+			]),
+		);
+		expect(judge.args.join(" ")).toContain("model_reasoning_effort=high");
+		expect(judge.useStdin).toBe(true);
+		expect(judge.useOutputFile).toBe(true);
+		// Verdict parsing is the judge path's, not a critic re-anchor: the raw text reaches parseVerdict.
+		expect(
+			judge.parseOutput('preamble\n## ALLOW: fine\n{"decision":"allow"}\n'),
+		).toBe('preamble\n## ALLOW: fine\n{"decision":"allow"}');
+	});
+
+	it("keeps the grok critic guards on the grok judge without plan mode", () => {
+		const judge = getProviderConfig("grokjudge", "review", {
+			modelOverride: "grok-4.7",
+			judgeCwd: "/disposable/work",
+			judgeTools: ["Read", "Bash"],
+		});
+		const critic = getProviderConfig("grok");
+		const args = judge.buildArgs("/tmp/judge-prompt.md");
+		expect(judge.cmd).toBe(critic.cmd);
+		expect(judge.env.GROK_HOME).toBe(critic.env.GROK_HOME);
+		expect(judge.env.GROK_TELEMETRY_ENABLED).toBe("0");
+		expect(judge.promptAsTempFile).toBe(true);
+		expect(args).toEqual(
+			expect.arrayContaining(["--prompt-file", "/tmp/judge-prompt.md"]),
+		);
+		expect(args).toEqual(expect.arrayContaining(["-m", "grok-4.7"]));
+		expect(args).not.toContain("plan");
+		expect(args[args.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
+		expect(args).toContain("--no-plan");
+		const deny = args[args.indexOf("--disallowed-tools") + 1];
+		for (const tool of [
+			"search_replace",
+			"spawn_subagent",
+			"workflow",
+			"search_tool",
+		])
+			expect(deny.split(",")).toContain(tool);
+		// Repo read and execution stay available; no edits, no subagents, no web.
+		expect(deny.split(",")).not.toContain("run_terminal_command");
+		expect(args).toContain("--no-subagents");
+		expect(args).toContain("--disable-web-search");
+		expect(judge.parseOutput("  ## BLOCK: x\n")).toBe("## BLOCK: x");
+	});
+
+	it("forwards the disposable workspace to both new judge providers", () => {
+		for (const provider of ["codexjudge", "grokjudge"]) {
+			const judge = getProviderConfig(provider, "review", {
+				judgeCwd: "/disposable/work",
+			});
+			expect(judge.cwd, provider).toBe("/disposable/work");
+		}
+	});
+
+	it("denies Grok terminal execution without both Bash and a disposable workspace", () => {
+		for (const options of [
+			{},
+			{ judgeTools: ["Bash"] },
+			{ judgeCwd: "/disposable/work", judgeTools: ["Read", "Grep", "Glob"] },
+		]) {
+			const args = getProviderConfig("grokjudge", "review", options).buildArgs(
+				"prompt.md",
+			);
+			expect(args[args.indexOf("--permission-mode") + 1]).toBe("plan");
+			expect(args[args.indexOf("--disallowed-tools") + 1].split(",")).toContain(
+				"run_terminal_command",
+			);
+		}
+	});
+
+	it("records the judge that actually ran, including a retry, in the run record", () => {
+		const runDir = writeLog({
+			judge: "gpt-6.1-sol",
+			judgeProvider: "codex",
+			judgeRetried: true,
+			phase2: { provider: "judge", ok: true, durationMs: 1, error: null },
+			judgeFullOutput: {
+				provider: "judge",
+				ok: true,
+				output: "## ALLOW: fine",
+				durationMs: 1,
+			},
+		});
+		try {
+			const meta = JSON.parse(
+				readFileSync(path.join(runDir, "meta.json"), "utf8"),
+			);
+			expect(meta).toMatchObject({
+				judge: "gpt-6.1-sol",
+				judgeProvider: "codex",
+				judgeRetried: true,
+			});
+			expect(meta.judgeFullOutput).toBeUndefined();
+		} finally {
+			rmSync(runDir, { recursive: true, force: true });
+		}
 	});
 });
